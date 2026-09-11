@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>CWA 騎乘即時風況 V0.4.1</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--text:#111;--muted:#666;--line:#e8e8e8}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:var(--text)}
+.wrap{max-width:780px;margin:auto;padding:12px}
+.card{background:var(--card);border-radius:14px;padding:14px;margin-bottom:12px;box-shadow:0 1px 6px rgba(0,0,0,.08)}
+button,select,input{font-size:16px;padding:10px;border-radius:10px;border:1px solid #ccc;background:#fff}
+button{cursor:pointer;min-height:44px}
+button.primary{font-weight:800;font-size:18px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.station{border-top:1px solid var(--line);padding:12px 0}
+.station:first-child{border-top:0}
+.muted{color:var(--muted);font-size:14px}
+.big{font-size:22px;font-weight:800}
+.ok{color:#087f23}.warn{color:#b35b00}.bad{color:#b00020}
+.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#eef1f5;font-size:13px;margin-left:4px}
+.summary{font-size:17px;line-height:1.6}
+.toggle{display:flex;gap:8px}
+.toggle button.active{font-weight:700;border:2px solid #333}
+.band{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
+.band:first-child{border-top:0;padding-top:0;margin-top:0}
+.bandTitle{font-size:18px;font-weight:800;margin-bottom:4px}
+.kpi{font-size:25px;font-weight:900;line-height:1.15}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.statusLine{font-size:15px;line-height:1.5}
+.stale{color:#b00020;font-weight:700}
+.fresh{color:#087f23}
+.soft{background:#f8fafc;border-radius:10px;padding:10px}
+.rideOnly{display:none}
+body.ride .detailCard{display:none}
+body.ride .rideOnly{display:block}
+body.ride .wrap{max-width:600px}
+body.ride .kpi{font-size:32px}
+@media(max-width:560px){
+  .wrap{padding:9px}.card{padding:12px}
+  button,select,input{width:100%}
+  .row{align-items:stretch}.big{font-size:20px}
+  .toggle{display:grid;grid-template-columns:1fr 1fr}
+  .grid2{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="big">CWA 騎乘即時風況 V0.4.1</div>
+    <div class="muted">省電 GPS｜CWA 自動更新｜前方 20/40/60 km｜側向偏移過濾｜資料新鮮度｜騎乘模式可返回</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="refreshAllBtn" class="primary" style="flex:1">一鍵更新 GPS + CWA + 前方風況</button>
+      <button id="rideBtn">切換騎乘大字模式</button>
+    </div>
+    <div id="status" class="statusLine muted" style="margin-top:10px">尚未啟動</div>
+    <div id="countdown" class="muted"></div>
+  </div>
+
+  <div class="card detailCard">
+    <div class="row">
+      <label for="key">CWA API Key</label>
+      <input id="key" type="password" placeholder="貼上授權碼" autocomplete="off" style="flex:1;min-width:220px" />
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:14px">
+        <input id="rememberKey" type="checkbox" checked style="width:auto" />
+        記住 API Key
+      </label>
+      <button id="clearKeyBtn" type="button">清除 Key</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid2">
+      <div>
+        <div class="muted">目前位置</div>
+        <div id="pos" class="summary">—</div>
+      </div>
+      <div>
+        <div class="muted">速度 / 方向</div>
+        <div id="motion" class="summary">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card detailCard">
+    <div><b>定位 / 更新設定</b></div>
+    <div class="row" style="margin-top:8px">
+      <label>GPS 間隔
+        <select id="gpsInterval">
+          <option value="15">15 秒</option>
+          <option value="30" selected>30 秒（建議）</option>
+          <option value="60">60 秒（省電）</option>
+        </select>
+      </label>
+      <label>CWA 間隔
+        <select id="cwaInterval">
+          <option value="5">5 分鐘</option>
+          <option value="10" selected>10 分鐘（建議）</option>
+          <option value="15">15 分鐘</option>
+        </select>
+      </label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="startBtn">開始省電追蹤</button>
+      <button id="stopBtn">停止追蹤</button>
+    </div>
+  </div>
+
+  <div class="card detailCard">
+    <div><b>騎乘方向</b></div>
+    <div class="toggle" style="margin-top:8px">
+      <button id="autoBtn" class="active">自動 GPS</button>
+      <button id="manualBtn">手動備援</button>
+    </div>
+    <div id="autoPanel" style="margin-top:10px">
+      <div id="headingDisplay" class="summary">尚未取得有效方向</div>
+      <div class="muted">低速或停車時沿用最後有效方向，避免 GPS 漂移。</div>
+    </div>
+    <div id="manualPanel" style="display:none;margin-top:10px">
+      <select id="manualHeading">
+        <option value="0">北 0°</option><option value="45">東北 45°</option>
+        <option value="90">東 90°</option><option value="135">東南 135°</option>
+        <option value="180" selected>南 180°</option><option value="225">西南 225°</option>
+        <option value="270">西 270°</option><option value="315">西北 315°</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="card detailCard">
+    <div><b>沿線篩選</b></div>
+    <div class="row" style="margin-top:8px">
+      <label>最大側向偏移
+        <select id="crossLimit">
+          <option value="8">8 km</option>
+          <option value="12" selected>12 km（建議）</option>
+          <option value="15">15 km</option>
+          <option value="20">20 km</option>
+        </select>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px">
+        <input id="lowlandOnly" type="checkbox" checked style="width:auto" />
+        平地模式：排除海拔 > 300 m
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div><b>目前附近風況</b></div>
+    <div id="summary" class="summary muted">尚未載入</div>
+  </div>
+
+  <div class="card">
+    <div><b>前方風況</b></div>
+    <div id="trend" class="soft muted">尚未載入</div>
+    <div id="bands" style="margin-top:8px">尚未載入</div>
+  </div>
+
+  <div class="card rideOnly">
+    <div class="muted">騎乘模式：詳細測站已隱藏；按上方「一鍵更新」即可。</div>
+  </div>
+
+  <div class="card detailCard">
+    <div><b>最近 5 個測站</b></div>
+    <div id="stations" class="muted">尚未載入</div>
+  </div>
+</div>
+
+<script>
+const API_BASE='https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001';
+const KEY_STORAGE='cwaWindApiKey';
+
+let currentPos=null, previousPos=null;
+let allStations=[];
+let mode='auto';
+let lastValidHeading=null, lastHeadingSource='—';
+let gpsTimer=null, cwaTimer=null, countdownTimer=null;
+let lastCwaFetch=null, nextCwaFetch=null;
+let tracking=false;
+
+const $=id=>document.getElementById(id);
+const rad=x=>x*Math.PI/180;
+const deg=x=>x*180/Math.PI;
+const norm360=x=>(x%360+360)%360;
+
+function angDiff(a,b){let d=Math.abs(norm360(a)-norm360(b));return d>180?360-d:d}
+function hav(lat1,lon1,lat2,lon2){
+  const R=6371,dLat=rad(lat2-lat1),dLon=rad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2+Math.cos(rad(lat1))*Math.cos(rad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a))
+}
+function bearing(lat1,lon1,lat2,lon2){
+  const p1=rad(lat1),p2=rad(lat2),dl=rad(lon2-lon1);
+  const y=Math.sin(dl)*Math.cos(p2);
+  const x=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
+  return norm360(deg(Math.atan2(y,x)))
+}
+function dirText(d){
+  if(!isFinite(d)||d<0)return'—';
+  const dirs=['北','北北東','東北','東北東','東','東南東','東南','南南東','南','南南西','西南','西南西','西','西北西','西北','北北西'];
+  return dirs[Math.round(d/22.5)%16]
+}
+function validNum(x){const n=+x;return Number.isFinite(n)&&n>-90?n:null}
+function getWGS84(st){
+  const cs=st?.GeoInfo?.Coordinates||[];
+  const c=cs.find(x=>x.CoordinateName==='WGS84')||cs[0];
+  return c?{lat:+c.StationLatitude,lon:+c.StationLongitude}:null
+}
+function getHeading(){
+  if(mode==='manual')return +$('manualHeading').value;
+  return lastValidHeading!==null?lastValidHeading:+$('manualHeading').value;
+}
+function windParts(wd,ws,heading){
+  const d=rad(wd-heading),headRaw=ws*Math.cos(d);
+  const cross=Math.abs(ws*Math.sin(d));
+  const tail=Math.max(0,-headRaw),head=Math.max(0,headRaw);
+  const ad=angDiff(wd,heading);
+  let type=ad<=45?'逆風':ad>=135?'順風':head>0?'側逆風':'側順風';
+  return{head,tail,cross,type}
+}
+function typeClass(t){return t.includes('逆')?'bad':t.includes('順')?'ok':'warn'}
+function obsAgeMin(obs){
+  const t=Date.parse(obs);
+  return Number.isFinite(t)?Math.max(0,(Date.now()-t)/60000):null
+}
+function ageLabel(obs){
+  const a=obsAgeMin(obs);
+  if(a===null)return '<span class="muted">時間未知</span>';
+  if(a>30)return `<span class="stale">${Math.round(a)} 分鐘前（偏舊）</span>`;
+  if(a>20)return `<span class="warn">${Math.round(a)} 分鐘前</span>`;
+  return `<span class="fresh">${Math.round(a)} 分鐘前</span>`;
+}
+function stationHtml(s,i,heading,showTrack=false){
+  const p=windParts(s.wd,s.ws,heading);
+  const track=showTrack?`<div class="muted">前進距離 ${s.along.toFixed(1)} km｜側向偏移 ${s.crossTrack.toFixed(1)} km｜海拔 ${Math.round(s.alt||0)} m</div>`:'';
+  return `<div class="station">
+    <div><b>${i+1}. ${s.name}</b> <span class="muted">${s.id}</span>
+      <span class="pill ${typeClass(p.type)}">${p.type}</span></div>
+    <div>${s.county}${s.town}｜直線 ${s.dist.toFixed(1)} km</div>
+    ${track}
+    <div>風向：${dirText(s.wd)} ${s.wd.toFixed(0)}°｜風速：<b>${s.ws.toFixed(1)} m/s</b>${s.gust!==null?`｜陣風：${s.gust.toFixed(1)} m/s`:''}</div>
+    <div>逆風 <b>${p.head.toFixed(1)}</b>｜順風 <b>${p.tail.toFixed(1)}</b>｜側風 <b>${p.cross.toFixed(1)} m/s</b></div>
+    <div class="muted">觀測：${ageLabel(s.obs)}｜${s.obs||'—'}</div>
+  </div>`
+}
+
+function saveKeyIfNeeded(){
+  try{
+    if($('rememberKey').checked&&$('key').value.trim())localStorage.setItem(KEY_STORAGE,$('key').value.trim());
+    else if(!$('rememberKey').checked)localStorage.removeItem(KEY_STORAGE);
+  }catch(e){}
+}
+function loadSavedKey(){
+  try{
+    const saved=localStorage.getItem(KEY_STORAGE);
+    if(saved){$('key').value=saved;$('rememberKey').checked=true}
+  }catch(e){}
+}
+$('key').addEventListener('change',saveKeyIfNeeded);
+$('key').addEventListener('blur',saveKeyIfNeeded);
+$('rememberKey').onchange=saveKeyIfNeeded;
+$('clearKeyBtn').onclick=()=>{try{localStorage.removeItem(KEY_STORAGE)}catch(e){};$('key').value='';$('rememberKey').checked=false;$('status').textContent='已清除 API Key'};
+
+function setMode(m){
+  mode=m;
+  $('autoBtn').classList.toggle('active',m==='auto');
+  $('manualBtn').classList.toggle('active',m==='manual');
+  $('autoPanel').style.display=m==='auto'?'block':'none';
+  $('manualPanel').style.display=m==='manual'?'block':'none';
+  renderHeading();render();
+}
+$('autoBtn').onclick=()=>setMode('auto');
+$('manualBtn').onclick=()=>setMode('manual');
+$('manualHeading').onchange=render;
+$('crossLimit').onchange=render;
+$('lowlandOnly').onchange=render;
+$('rideBtn').onclick=()=>{
+  document.body.classList.toggle('ride');
+  $('rideBtn').textContent=document.body.classList.contains('ride')
+    ? '返回完整模式'
+    : '切換騎乘大字模式';
+};
+
+function renderHeading(){
+  const h=getHeading();
+  $('headingDisplay').innerHTML=lastValidHeading===null&&mode==='auto'
+    ?'尚未取得有效方向'
+    :`<b>${dirText(h)} ${h.toFixed(0)}°</b> <span class="muted">（${mode==='manual'?'手動':lastHeadingSource}）</span>`;
+}
+
+function updateGeometry(){
+  if(!currentPos)return;
+  const h=getHeading();
+  for(const s of allStations){
+    s.dist=hav(currentPos.lat,currentPos.lon,s.lat,s.lon);
+    s.bearing=bearing(currentPos.lat,currentPos.lon,s.lat,s.lon);
+    const d=rad(angDiff(s.bearing,h));
+    s.along=s.dist*Math.cos(d);
+    s.crossTrack=Math.abs(s.dist*Math.sin(d));
+  }
+}
+
+function vectorSummary(stations,heading){
+  if(!stations.length)return null;
+  let x=0,y=0,sumW=0,sumS=0;
+  for(const s of stations){
+    const w=Math.max(s.ws,0.1);
+    x+=w*Math.cos(rad(s.wd));y+=w*Math.sin(rad(s.wd));sumW+=w;sumS+=s.ws;
+  }
+  const meanDir=norm360(deg(Math.atan2(y,x)));
+  const consistency=Math.sqrt(x*x+y*y)/sumW;
+  const avg=sumS/stations.length;
+  return{meanDir,avg,consistency,p:windParts(meanDir,avg,heading)}
+}
+
+function render(){
+  if(!allStations.length||!currentPos)return;
+  const h=getHeading();
+  updateGeometry();
+
+  const nearest=[...allStations].sort((a,b)=>a.dist-b.dist).slice(0,5);
+  const s=vectorSummary(nearest,h);
+  if(s){
+    const consistency=s.consistency>0.75?'高':s.consistency>0.45?'中':'低';
+    $('summary').innerHTML=`主風向 <b>${dirText(s.meanDir)} ${s.meanDir.toFixed(0)}°</b>｜平均 <b>${s.avg.toFixed(1)} m/s</b>｜一致性 <b>${consistency}</b><br>
+    對騎乘方向 <b>${dirText(h)} ${h.toFixed(0)}°</b>：<b class="${typeClass(s.p.type)}">${s.p.type}</b>（逆 ${s.p.head.toFixed(1)} / 順 ${s.p.tail.toFixed(1)} / 側 ${s.p.cross.toFixed(1)} m/s）`;
+  }
+  $('stations').innerHTML=nearest.map((x,i)=>stationHtml(x,i,h,false)).join('');
+
+  const crossLimit=+$('crossLimit').value;
+  const lowland=$('lowlandOnly').checked;
+  const candidates=allStations.filter(x=>x.along>0&&x.crossTrack<=crossLimit&&(!lowland||(x.alt??0)<=300));
+
+  const defs=[[0,20],[20,40],[40,60]];
+  const bandData=[];
+  $('bands').innerHTML=defs.map(([a,b])=>{
+    const arr=candidates.filter(x=>x.along>=a&&x.along<b)
+      .sort((x,y)=>(x.crossTrack-y.crossTrack)|| (x.along-y.along))
+      .slice(0,3);
+    const vs=vectorSummary(arr,h);
+    bandData.push({a,b,arr,vs});
+    if(!arr.length)return `<div class="band"><div class="bandTitle">${a}–${b} km</div><div class="muted">沒有符合側向偏移條件的有效測站</div></div>`;
+    const p=vs.p;
+    return `<div class="band">
+      <div class="bandTitle">${a}–${b} km</div>
+      <div class="kpi ${typeClass(p.type)}">${p.type}｜${p.head>0?'逆 '+p.head.toFixed(1):'順 '+p.tail.toFixed(1)} m/s</div>
+      <div class="muted">代表風向 ${dirText(vs.meanDir)} ${vs.meanDir.toFixed(0)}°｜平均 ${vs.avg.toFixed(1)} m/s｜${arr.length} 站</div>
+      ${arr.map((x,i)=>stationHtml(x,i,h,true)).join('')}
+    </div>`;
+  }).join('');
+
+  const validBands=bandData.filter(x=>x.vs);
+  if(validBands.length>=2){
+    const heads=validBands.map(x=>x.vs.p.head-x.vs.p.tail);
+    const first=heads[0],last=heads[heads.length-1];
+    let msg='前方風況大致持平';
+    if(last-first>=0.8)msg='前方逆風有增強趨勢';
+    else if(last-first<=-0.8)msg='前方風況逐漸改善／較偏順風';
+    $('trend').innerHTML=`<b>${msg}</b><br><span class="muted">依目前符合條件的沿線測站比較，僅作即時趨勢參考，不等同氣象預報。</span>`;
+  }else{
+    $('trend').textContent='目前可用的前方距離帶不足，暫不判定趨勢。';
+  }
+}
+
+function processPosition(p){
+  const now={
+    lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy,
+    speed:p.coords.speed,heading:p.coords.heading,t:p.timestamp
+  };
+  currentPos=now;
+
+  const kmh=(now.speed!==null&&isFinite(now.speed))?now.speed*3.6:null;
+  let candidate=null,source='';
+
+  if(now.heading!==null&&isFinite(now.heading)&&kmh!==null&&kmh>=5){
+    candidate=norm360(now.heading);source='GPS heading';
+  }else if(previousPos){
+    const moved=hav(previousPos.lat,previousPos.lon,now.lat,now.lon);
+    const dt=(now.t-previousPos.t)/1000;
+    const derived=dt>0?moved/dt*3600:0;
+    if(moved>=0.020&&derived>=5){
+      candidate=bearing(previousPos.lat,previousPos.lon,now.lat,now.lon);
+      source='GPS 位置推算';
+    }
+  }
+
+  if(candidate!==null){lastValidHeading=candidate;lastHeadingSource=source}
+  previousPos=now;
+
+  $('pos').textContent=`${now.lat.toFixed(6)}, ${now.lon.toFixed(6)}（±${Math.round(now.acc)} m）`;
+  $('motion').innerHTML=`${kmh===null?'速度 —':kmh.toFixed(1)+' km/h'}<br>${lastValidHeading===null?'方向 —':dirText(getHeading())+' '+getHeading().toFixed(0)+'°'}`;
+  renderHeading();render();
+}
+
+function getGpsOnce(){
+  return new Promise((resolve,reject)=>{
+    if(!navigator.geolocation)return reject(new Error('此瀏覽器不支援定位'));
+    navigator.geolocation.getCurrentPosition(
+      p=>{processPosition(p);resolve(p)},
+      e=>reject(new Error(`定位失敗（${e.code}）：${e.message}`)),
+      {enableHighAccuracy:true,timeout:15000,maximumAge:10000}
+    );
+  });
+}
+
+async function fetchCwa(){
+  const key=$('key').value.trim();
+  if(!key)throw new Error('請先輸入 CWA API Key');
+  if(!currentPos)throw new Error('尚未取得 GPS 位置');
+  saveKeyIfNeeded();
+
+  const r=await fetch(`${API_BASE}?Authorization=${encodeURIComponent(key)}`);
+  if(!r.ok)throw new Error(`CWA HTTP ${r.status}`);
+  const j=await r.json();
+
+  allStations=(j?.records?.Station||[]).map(st=>{
+    const c=getWGS84(st);if(!c)return null;
+    const w=st.WeatherElement||{};
+    const ws=validNum(w.WindSpeed),wd=validNum(w.WindDirection);
+    if(ws===null||wd===null)return null;
+    return{
+      name:st.StationName,id:st.StationId,
+      county:st.GeoInfo?.CountyName||'',town:st.GeoInfo?.TownName||'',
+      obs:st.ObsTime?.DateTime||'',lat:c.lat,lon:c.lon,
+      alt:validNum(st.GeoInfo?.StationAltitude)??0,
+      wd,ws,gust:validNum(w?.GustInfo?.PeakGustSpeed)
+    };
+  }).filter(Boolean);
+
+  lastCwaFetch=new Date();
+  const mins=+$('cwaInterval').value;
+  nextCwaFetch=new Date(Date.now()+mins*60000);
+  render();
+  return allStations.length;
+}
+
+async function refreshAll(){
+  $('status').textContent='更新中：取得 GPS…';
+  try{
+    await getGpsOnce();
+    $('status').textContent='更新中：讀取 CWA…';
+    const n=await fetchCwa();
+    $('status').textContent=`更新完成｜${new Date().toLocaleTimeString()}｜${n} 個有效測站`;
+  }catch(e){
+    $('status').textContent=e.message;
+  }
+}
+$('refreshAllBtn').onclick=refreshAll;
+
+function scheduleGps(){
+  if(gpsTimer)clearInterval(gpsTimer);
+  const sec=+$('gpsInterval').value;
+  gpsTimer=setInterval(async()=>{
+    if(!tracking)return;
+    try{await getGpsOnce()}catch(e){$('status').textContent=e.message}
+  },sec*1000);
+}
+function scheduleCwa(){
+  if(cwaTimer)clearInterval(cwaTimer);
+  const mins=+$('cwaInterval').value;
+  cwaTimer=setInterval(async()=>{
+    if(!tracking||!$('key').value.trim())return;
+    try{
+      const n=await fetchCwa();
+      $('status').textContent=`CWA 自動更新完成｜${new Date().toLocaleTimeString()}｜${n} 站`;
+    }catch(e){$('status').textContent=e.message}
+  },mins*60000);
+}
+
+$('gpsInterval').onchange=()=>{if(tracking)scheduleGps()};
+$('cwaInterval').onchange=()=>{if(tracking){scheduleCwa();nextCwaFetch=new Date(Date.now()+(+$('cwaInterval').value)*60000)}};
+
+$('startBtn').onclick=async()=>{
+  if(tracking)return;
+  tracking=true;
+  $('status').textContent='省電追蹤啟動中…';
+  try{await getGpsOnce()}catch(e){$('status').textContent=e.message}
+  scheduleGps();scheduleCwa();
+  if($('key').value.trim()){
+    try{await fetchCwa()}catch(e){$('status').textContent=e.message}
+  }
+  $('status').textContent='省電追蹤中';
+};
+
+$('stopBtn').onclick=()=>{
+  tracking=false;
+  if(gpsTimer)clearInterval(gpsTimer);
+  if(cwaTimer)clearInterval(cwaTimer);
+  gpsTimer=cwaTimer=null;
+  $('status').textContent='追蹤已停止';
+};
+
+countdownTimer=setInterval(()=>{
+  if(!lastCwaFetch){
+    $('countdown').textContent='CWA 尚未更新';
+    return;
+  }
+  const ago=Math.max(0,Math.floor((Date.now()-lastCwaFetch.getTime())/60000));
+  let next='—';
+  if(nextCwaFetch){
+    const sec=Math.max(0,Math.floor((nextCwaFetch.getTime()-Date.now())/1000));
+    next=`${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`;
+  }
+  $('countdown').textContent=`CWA 上次更新 ${ago} 分鐘前｜下次自動更新 ${next}`;
+},1000);
+
+loadSavedKey();
+renderHeading();
+</script>
+</body>
+</html>
