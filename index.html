@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>CWA 騎乘即時風況 MVP</title>
+<style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f5f6f8;color:#111}
+.wrap{max-width:720px;margin:auto;padding:16px}.card{background:#fff;border-radius:14px;padding:14px;margin-bottom:12px;box-shadow:0 1px 6px rgba(0,0,0,.08)}
+button,select,input{font-size:16px;padding:10px;border-radius:10px;border:1px solid #ccc}button{cursor:pointer}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.station{border-top:1px solid #eee;padding:12px 0}.station:first-child{border-top:0}.muted{color:#666;font-size:14px}.big{font-size:22px;font-weight:700}.ok{color:#087f23}.warn{color:#b35b00}.bad{color:#b00020}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="big">CWA 騎乘即時風況 MVP</div>
+    <div class="muted">V0.1：手機定位 → 抓 CWA 即時觀測 → 顯示最近 5 個測站</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label for="key">CWA API Key</label>
+      <input id="key" type="password" placeholder="貼上授權碼" style="flex:1;min-width:220px" />
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="locBtn">取得目前位置</button>
+      <button id="loadBtn">更新 CWA</button>
+    </div>
+    <div id="status" class="muted" style="margin-top:10px">尚未定位</div>
+  </div>
+
+  <div class="card">
+    <div><b>目前位置</b></div>
+    <div id="pos">—</div>
+  </div>
+
+  <div class="card">
+    <div><b>最近 5 個測站</b></div>
+    <div id="stations" class="muted">尚未載入</div>
+  </div>
+</div>
+<script>
+const API_BASE = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001';
+let currentPos = null;
+
+const $ = id => document.getElementById(id);
+function rad(x){return x*Math.PI/180}
+function hav(lat1,lon1,lat2,lon2){
+  const R=6371;
+  const dLat=rad(lat2-lat1), dLon=rad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2+Math.cos(rad(lat1))*Math.cos(rad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+function dirText(d){
+  if(!isFinite(d) || d<0) return '—';
+  const dirs=['北','北北東','東北','東北東','東','東南東','東南','南南東','南','南南西','西南','西南西','西','西北西','西北','北北西'];
+  return dirs[Math.round(d/22.5)%16];
+}
+function getWGS84(st){
+  const cs = st?.GeoInfo?.Coordinates || [];
+  const c = cs.find(x=>x.CoordinateName==='WGS84') || cs[0];
+  return c ? {lat:+c.StationLatitude, lon:+c.StationLongitude} : null;
+}
+function validNum(x){const n=+x; return Number.isFinite(n) && n>-90 ? n : null}
+
+$('locBtn').onclick=()=>{
+  if(!navigator.geolocation){$('status').textContent='此瀏覽器不支援定位';return}
+  $('status').textContent='定位中…';
+  navigator.geolocation.getCurrentPosition(p=>{
+    currentPos={lat:p.coords.latitude,lon:p.coords.longitude,acc:p.coords.accuracy};
+    $('pos').textContent=`${currentPos.lat.toFixed(6)}, ${currentPos.lon.toFixed(6)}（±${Math.round(currentPos.acc)} m）`;
+    $('status').textContent='定位完成';
+  },e=>{$('status').textContent='定位失敗：'+e.message},{enableHighAccuracy:true,timeout:15000,maximumAge:30000});
+};
+
+$('loadBtn').onclick=async()=>{
+  const key=$('key').value.trim();
+  if(!key){alert('請先貼上 CWA API Key');return}
+  if(!currentPos){alert('請先取得目前位置');return}
+  $('status').textContent='讀取 CWA 即時資料…';
+  try{
+    const url=`${API_BASE}?Authorization=${encodeURIComponent(key)}`;
+    const r=await fetch(url);
+    if(!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j=await r.json();
+    const stations=(j?.records?.Station||[]).map(st=>{
+      const c=getWGS84(st); if(!c) return null;
+      const w=st.WeatherElement||{};
+      return {
+        name:st.StationName,id:st.StationId,county:st.GeoInfo?.CountyName||'',town:st.GeoInfo?.TownName||'',
+        obs:st.ObsTime?.DateTime||'',lat:c.lat,lon:c.lon,
+        dist:hav(currentPos.lat,currentPos.lon,c.lat,c.lon),
+        wd:validNum(w.WindDirection),ws:validNum(w.WindSpeed),gust:validNum(w?.GustInfo?.PeakGustSpeed)
+      };
+    }).filter(Boolean).filter(x=>x.ws!==null && x.wd!==null).sort((a,b)=>a.dist-b.dist).slice(0,5);
+    if(!stations.length){$('stations').textContent='沒有可用測站資料';return}
+    $('stations').innerHTML=stations.map((s,i)=>`<div class="station">
+      <div><b>${i+1}. ${s.name}</b> <span class="muted">${s.id}</span></div>
+      <div>${s.county}${s.town}｜${s.dist.toFixed(1)} km</div>
+      <div>風向：${dirText(s.wd)} ${s.wd.toFixed(0)}°｜風速：<b>${s.ws.toFixed(1)} m/s</b>${s.gust!==null?`｜陣風：${s.gust.toFixed(1)} m/s`:''}</div>
+      <div class="muted">觀測：${s.obs||'—'}</div>
+    </div>`).join('');
+    $('status').textContent='更新完成';
+  }catch(e){$('status').textContent='讀取失敗：'+e.message+'（若手機瀏覽器遇到 CORS，下一版可改成 serverless proxy）'}
+};
+</script>
+</body>
+</html>
