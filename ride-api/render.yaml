@@ -7,5 +7,9 @@ services:
     envVars:
       - key: CWA_API_KEY
         sync: false
+      - key: CURRENT_ROUTE_URL
+        value: "https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx"
       - key: CWA_CACHE_SECONDS
+        value: "300"
+      - key: ROUTE_CACHE_SECONDS
         value: "300"

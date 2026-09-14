@@ -1,32 +1,38 @@
-# 風況 API V0.1
+# CWA Ride API V0.2
 
-用途：讓 iPhone 捷徑在鎖屏時取得目前位置後，呼叫 API 並朗讀 `speech`。
+## 核心改動
+- route_id 固定為 `current`
+- 正式路線固定放在 GitHub：
+  `ride-api/routes/current.gpx`
+- 換路線時只需要覆蓋同名 `current.gpx`
+- iPhone 捷徑不用再改 route_id
+- Render 重啟後會重新從 GitHub 取得 current.gpx
 
-## 端點
-- `GET /health`
-- `POST /routes`：上傳 GPX，取得 route_id
-- `GET /status?route_id=...&lat=...&lon=...`
+## 升級方式
+1. 用 V0.2 的 `server.py`、`Dockerfile`、`render.yaml` 覆蓋 GitHub `ride-api/` 舊檔。
+2. 建立：
+   `ride-api/routes/`
+3. 將目前要使用的 GPX 改名：
+   `current.gpx`
+4. 上傳到：
+   `ride-api/routes/current.gpx`
+5. Commit。
+6. Render 會自動部署。
 
-## 本機測試
-1. 安裝 Python 3.12
-2. `pip install -r requirements.txt`
-3. 設定環境變數 `CWA_API_KEY`
-4. `uvicorn server:app --host 0.0.0.0 --port 8000`
-5. 開啟 `http://127.0.0.1:8000/docs`
+## 測試
+- `/health`
+- `/route`
 
-## 上傳 GPX
-在 `/docs` 展開 `POST /routes` → Try it out → 選 GPX → Execute。
-記下回傳的 `route_id`。
+正常時 `/health` 應出現：
+- version = 0.2.0
+- current_route_available = true
+- current_route_source = github
 
-## 查詢
-`/status?route_id=你的route_id&lat=24.1048&lon=120.6058`
+## iPhone 捷徑固定網址
+`https://cwa-ride-api.onrender.com/status?route_id=current&lat=[緯度]&lon=[經度]`
 
-回傳 JSON 裡的 `speech` 就是 iPhone 要朗讀的文字。
+## 更換路線
+只需在 GitHub 用新的 GPX 覆蓋：
+`ride-api/routes/current.gpx`
 
-## Render 部署
-- 將本資料夾放進 GitHub repo
-- Render 建立 Docker Web Service
-- Environment Variables 新增 `CWA_API_KEY`
-- 部署完成後，用 HTTPS 網址測 `/health`
-
-注意：V0.1 的 GPX 暫存在伺服器本機 `routes/`。某些免費雲端重建後可能消失，這版先用來驗證「iPhone 捷徑 → API → 語音」流程。
+不用再修改捷徑。
