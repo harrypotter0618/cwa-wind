@@ -3,6 +3,7 @@ import datetime as dt
 import math
 import logging
 import json
+import hashlib
 import os
 import threading
 import time
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from eccodes import (
     codes_get,
+    codes_get_array,
     codes_get_api_version,
     codes_grib_find_nearest,
     codes_grib_new_from_file,
@@ -21,7 +23,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -43,6 +45,14 @@ UV_CACHE_TTL = int(os.getenv("UV_CACHE_TTL_SECONDS", "1200"))
 KEEP_FULL_GRIB = os.getenv("KEEP_FULL_GRIB", "false").strip().lower() in {"1","true","yes","on"}
 UV_CACHE_DIR = CACHE_DIR / "uv10"
 UV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# V0.2.3: cache route-coordinate -> WRF grid indices + IDW weights.
+# This is independent of forecast hour/model cycle as long as grid geometry is unchanged.
+GRIDMAP_CACHE_DIR = CACHE_DIR / "gridmap"
+GRIDMAP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+GRIDMAP_CACHE_FILE = GRIDMAP_CACHE_DIR / "grid_index_v1.json"
+GRIDMAP_VERSION = 1
+_gridmap_lock = threading.Lock()
 
 CURRENT_ROUTE_URL = os.getenv(
     "CURRENT_ROUTE_URL",
@@ -237,9 +247,14 @@ def _read_uv_meta(meta_path: Path):
         return None
 
 
-def _uv_cache_is_fresh(uv_path: Path, meta_path: Path):
+def _uv_cache_is_fresh(uv_path: Path, meta_path: Path, fh: int):
+    # FH000 is our "is there a new model cycle?" probe and keeps the TTL.
+    # Other hours stay cached until FH000 reveals a newer cycle; the cycle
+    # validation in load_*_for_cycle() will then invalidate/rebuild them.
     if not uv_path.exists() or not meta_path.exists():
         return False
+    if fh != 0:
+        return True
     age = time.time() - min(uv_path.stat().st_mtime, meta_path.stat().st_mtime)
     return age < UV_CACHE_TTL
 
@@ -253,7 +268,7 @@ def build_uv10_cache(fh: int, force: bool = False):
     validate_fh(fh)
     uv_path, meta_path = uv_cache_paths(fh)
 
-    if (not force) and _uv_cache_is_fresh(uv_path, meta_path):
+    if (not force) and _uv_cache_is_fresh(uv_path, meta_path, fh):
         meta = _read_uv_meta(meta_path)
         if meta:
             diag(
@@ -386,6 +401,172 @@ def idw4(gid, lat: float, lon: float):
         value = sum(w * r["value"] for w, r in zip(weights, rows)) / sum(weights)
 
     return value, rows
+
+
+def grid_fingerprint(gid) -> str:
+    """Stable identifier for the WRF grid geometry."""
+    keys = [
+        "gridType", "numberOfPoints", "Ni", "Nj", "Nx", "Ny",
+        "latitudeOfFirstGridPointInDegrees",
+        "longitudeOfFirstGridPointInDegrees",
+        "latitudeOfLastGridPointInDegrees",
+        "longitudeOfLastGridPointInDegrees",
+        "DxInMetres", "DyInMetres",
+        "LaDInDegrees", "LoVInDegrees",
+    ]
+    payload = {k: safe_get(gid, k, None) for k in keys}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def coord_cache_key(lat: float, lon: float) -> str:
+    return f"{lat:.6f},{lon:.6f}"
+
+
+def _load_gridmap_store():
+    try:
+        obj = json.loads(GRIDMAP_CACHE_FILE.read_text(encoding="utf-8"))
+        if obj.get("version") == GRIDMAP_VERSION:
+            return obj
+    except Exception:
+        pass
+    return {"version": GRIDMAP_VERSION, "grids": {}}
+
+
+def _save_gridmap_store(store):
+    tmp = GRIDMAP_CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(GRIDMAP_CACHE_FILE)
+
+
+def _mapping_from_nearest_points(pts):
+    rows = []
+    for p in pts:
+        rows.append({
+            "index": int(point_attr(p, "index")),
+            "lat": float(point_attr(p, "lat")),
+            "lon": float(point_attr(p, "lon")),
+            "distance_km": float(point_attr(p, "distance")),
+        })
+
+    rows.sort(key=lambda x: x["distance_km"])
+    if not rows:
+        raise RuntimeError("ecCodes returned no nearest grid point")
+
+    if rows[0]["distance_km"] < 1e-6 or len(rows) == 1:
+        weights = [1.0] + [0.0] * (len(rows) - 1)
+    else:
+        raw = [1.0 / max(r["distance_km"], 1e-6) ** 2 for r in rows]
+        total = sum(raw)
+        weights = [w / total for w in raw]
+
+    return {
+        "indices": [r["index"] for r in rows],
+        "weights": weights,
+        "points": rows,
+    }
+
+
+def get_grid_mappings(coords, reference_fh: int = 0):
+    """
+    Find 4 nearest WRF grid cells ONCE per coordinate and cache the
+    cell indices + IDW weights. The mapping is then reused by U/V and
+    every forecast hour.
+    """
+    uv_path, _ = build_uv10_cache(reference_fh)
+    t0 = time.time()
+
+    with open(uv_path, "rb") as f:
+        ref_gid = None
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            comp = classify_uv_message(gid)
+            if comp == "u":
+                ref_gid = gid
+                break
+            codes_release(gid)
+
+        if ref_gid is None:
+            raise RuntimeError(f"No U10 field found in {uv_path.name}")
+
+        try:
+            fp = grid_fingerprint(ref_gid)
+
+            with _gridmap_lock:
+                store = _load_gridmap_store()
+                grid_store = store["grids"].setdefault(fp, {})
+
+                mappings = [None] * len(coords)
+                misses = []
+
+                for i, (lat, lon) in enumerate(coords):
+                    key = coord_cache_key(lat, lon)
+                    cached = grid_store.get(key)
+                    if cached:
+                        mappings[i] = cached
+                    else:
+                        misses.append((i, lat, lon, key))
+
+                diag(
+                    f"[GRIDMAP] grid={fp} coords={len(coords)} "
+                    f"hit={len(coords)-len(misses)} miss={len(misses)}"
+                )
+
+                if misses:
+                    build_t0 = time.time()
+                    for n, (i, lat, lon, key) in enumerate(misses, start=1):
+                        try:
+                            pts = codes_grib_find_nearest(
+                                ref_gid, lat, lon, is_lsm=False, npoints=4
+                            )
+                        except Exception:
+                            pts = codes_grib_find_nearest(
+                                ref_gid, lat, lon, is_lsm=False, npoints=1
+                            )
+
+                        mapping = _mapping_from_nearest_points(pts)
+                        mappings[i] = mapping
+                        grid_store[key] = mapping
+                        diag(
+                            f"[GRIDMAP] built {n}/{len(misses)} "
+                            f"lat={lat:.5f} lon={lon:.5f}"
+                        )
+
+                    _save_gridmap_store(store)
+                    diag(
+                        f"[GRIDMAP] build complete new={len(misses)} "
+                        f"elapsed={time.time()-build_t0:.1f}s"
+                    )
+
+            diag(f"[GRIDMAP] ready elapsed={time.time()-t0:.1f}s")
+            return {"fingerprint": fp, "mappings": mappings}
+        finally:
+            codes_release(ref_gid)
+
+
+def apply_grid_mappings(values, gridmap):
+    out = []
+    point_sets = []
+    n = len(values)
+
+    for mapping in gridmap["mappings"]:
+        indices = mapping["indices"]
+        weights = mapping["weights"]
+
+        if any(idx < 0 or idx >= n for idx in indices):
+            raise RuntimeError("cached WRF grid index out of range")
+
+        value = sum(
+            float(values[idx]) * float(weight)
+            for idx, weight in zip(indices, weights)
+        )
+        out.append(value)
+        point_sets.append(mapping["points"])
+
+    return out, point_sets
+
 
 
 def classify_uv_message(gid) -> Optional[str]:
@@ -688,6 +869,71 @@ def idw4_many(gid, coords):
     return values, point_sets
 
 
+def read_uv_many_indexed(path: Path, coords, gridmap):
+    """
+    Fast path. U/V value arrays are read once; route values are taken
+    directly from cached grid indices. No nearest-grid search here.
+    """
+    meta = None
+    found = {}
+    t0 = time.time()
+    diag(f"[ECCODES_FAST] read start file={path.name} coords={len(coords)}")
+
+    with open(path, "rb") as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                if meta is None:
+                    meta = {
+                        "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
+                        "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
+                        "forecastTime": int(safe_get(gid, "forecastTime", 0) or 0),
+                    }
+
+                comp = classify_uv_message(gid)
+                if not comp or comp in found:
+                    continue
+
+                fp = grid_fingerprint(gid)
+                if fp != gridmap["fingerprint"]:
+                    raise RuntimeError(
+                        f"WRF grid changed: cached={gridmap['fingerprint']} current={fp}"
+                    )
+
+                values = codes_get_array(gid, "values")
+                vals, point_sets = apply_grid_mappings(values, gridmap)
+                found[comp] = {"values": vals, "points": point_sets}
+
+                if "u" in found and "v" in found:
+                    break
+            finally:
+                codes_release(gid)
+
+    if not meta:
+        raise HTTPException(
+            502,
+            detail={"code": "EMPTY_GRIB", "message": f"No GRIB messages in {path.name}."},
+        )
+
+    if "u" not in found or "v" not in found:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "UV10_NOT_FOUND",
+                "message": f"10 m U/V wind fields were not found in {path.name}.",
+            },
+        )
+
+    diag(
+        f"[ECCODES_FAST] read done file={path.name} "
+        f"elapsed={time.time()-t0:.2f}s"
+    )
+    return meta, found["u"], found["v"]
+
+
+
 def read_uv_many(path: Path, coords):
     meta = None
     found = {}
@@ -739,16 +985,38 @@ def read_uv_many(path: Path, coords):
     return meta, found["u"], found["v"]
 
 
-def load_uv_many_for_cycle(fh: int, coords, expected_init: int):
+def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
     uv_path, meta = build_uv10_cache(fh)
     got_init = int(meta["init_epoch"])
-    _, u, v = read_uv_many(uv_path, coords)
+
+    if gridmap is not None:
+        try:
+            _, u, v = read_uv_many_indexed(uv_path, coords, gridmap)
+        except Exception as e:
+            diag(
+                f"[ECCODES_FAST] fallback to V0.2.2 nearest search "
+                f"fh={fh:03d}: {e}"
+            )
+            _, u, v = read_uv_many(uv_path, coords)
+    else:
+        _, u, v = read_uv_many(uv_path, coords)
 
     if got_init != expected_init:
         invalidate_uv_cache(fh)
         uv_path, meta = build_uv10_cache(fh, force=True)
         got_init = int(meta["init_epoch"])
-        _, u, v = read_uv_many(uv_path, coords)
+
+        if gridmap is not None:
+            try:
+                _, u, v = read_uv_many_indexed(uv_path, coords, gridmap)
+            except Exception as e:
+                diag(
+                    f"[ECCODES_FAST] fallback after refresh "
+                    f"fh={fh:03d}: {e}"
+                )
+                _, u, v = read_uv_many(uv_path, coords)
+        else:
+            _, u, v = read_uv_many(uv_path, coords)
 
     return {
         "fh": fh,
@@ -792,13 +1060,6 @@ def parse_departure(value: Optional[str]):
 
 @app.get("/")
 def root():
-    diag(
-        f"[ROUTE_FORECAST] complete total={len(output)} "
-        f"available={len(available)} degraded={degraded_count} "
-        f"unavailable={unavailable_count} "
-        f"elapsed={time.time()-req_t0:.1f}s"
-    )
-
     return {
         "ok": True,
         "service": "wrf3km-api",
@@ -809,6 +1070,7 @@ def root():
         "route": "/route",
         "wind_example": "/wind?lat=24.15&lon=120.68",
         "route_forecast_example": "/route-forecast?speed_kmh=25&step_km=10",
+        "optimization": "cached WRF grid indices + direct value-array lookup",
     }
 
 
@@ -832,7 +1094,10 @@ def health():
         },
         "cache_dir": str(CACHE_DIR),
         "uv_cache_dir": str(UV_CACHE_DIR),
-        "uv_cache_ttl_seconds": UV_CACHE_TTL,
+        "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
+        "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
+        "grid_index_cache": True,
+        "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
         "keep_full_grib": KEEP_FULL_GRIB,
         "cwa_fileapi_fallback_configured": bool(CWA_API_KEY),
         "note": "Health check does not download a GRIB2 file.",
@@ -862,7 +1127,9 @@ def diagnostics():
         "version": VERSION,
         "diagnostic_logging": True,
         "uv10_compact_cache": True,
-        "message": "Route forecast progress and U/V cache hits are printed to Render logs.",
+        "grid_index_cache": True,
+        "fast_value_array_lookup": True,
+        "message": "Logs include U/V cache, GRIDMAP hits/misses and ECCODES_FAST timings.",
     }
 
 
@@ -992,11 +1259,22 @@ def route_forecast(
     sorted_hours = sorted(needed_hours)
     diag(f"[ROUTE_FORECAST] needed forecast hours={sorted_hours}")
 
+    # V0.2.3: nearest-grid search is done once for these route coordinates.
+    # If mapping creation fails on an unexpected ecCodes build, preserve
+    # accuracy/functionality by falling back to the proven V0.2.2 path.
+    gridmap = None
+    if sorted_hours:
+        diag("[ROUTE_FORECAST] preparing reusable WRF grid-index map")
+        try:
+            gridmap = get_grid_mappings(coords, reference_fh=0)
+        except Exception as e:
+            diag(f"[GRIDMAP] unavailable; using legacy nearest search: {e}")
+
     fields = {}
     for fh in sorted_hours:
         fh_t0 = time.time()
         diag(f"[ROUTE_FORECAST] fh={fh:03d} begin")
-        fields[fh] = load_uv_many_for_cycle(fh, coords, init)
+        fields[fh] = load_uv_many_for_cycle(fh, coords, init, gridmap)
         diag(
             f"[ROUTE_FORECAST] fh={fh:03d} done "
             f"cycle_ok={fields[fh]['matches_latest_cycle']} "
@@ -1135,6 +1413,13 @@ def route_forecast(
         },
     }
 
+    diag(
+        f"[ROUTE_FORECAST] complete total={len(output)} "
+        f"available={len(available)} degraded={degraded_count} "
+        f"unavailable={unavailable_count} "
+        f"elapsed={time.time()-req_t0:.1f}s"
+    )
+
     return {
         "ok": True,
         "service": "wrf3km-api",
@@ -1142,7 +1427,10 @@ def route_forecast(
         "model": MODEL_NAME,
         "performance": {
             "uv10_compact_cache": True,
-            "uv_cache_ttl_seconds": UV_CACHE_TTL,
+            "grid_index_cache": True,
+            "fast_value_array_lookup": True,
+            "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
+            "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
             "full_grib_retained": KEEP_FULL_GRIB,
         },
         "route": {
