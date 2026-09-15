@@ -2,6 +2,7 @@
 import datetime as dt
 import math
 import logging
+import json
 import os
 import threading
 import time
@@ -17,9 +18,10 @@ from eccodes import (
     codes_grib_find_nearest,
     codes_grib_new_from_file,
     codes_release,
+    codes_write,
 )
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -37,6 +39,10 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1200"))
 MAX_CACHE_MB = int(os.getenv("MAX_CACHE_MB", "450"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
+UV_CACHE_TTL = int(os.getenv("UV_CACHE_TTL_SECONDS", "1200"))
+KEEP_FULL_GRIB = os.getenv("KEEP_FULL_GRIB", "false").strip().lower() in {"1","true","yes","on"}
+UV_CACHE_DIR = CACHE_DIR / "uv10"
+UV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CURRENT_ROUTE_URL = os.getenv(
     "CURRENT_ROUTE_URL",
@@ -214,6 +220,127 @@ def download_grib(fh: int, force: bool = False) -> Path:
         cleanup_cache(keep=p)
         diag(f"[GRIB] ready fh={fh:03d} size_mb={p.stat().st_size/1024/1024:.1f} elapsed={time.time()-t0:.1f}s")
         return p
+
+
+def uv_cache_paths(fh: int):
+    stem = f"{data_id(fh)}_uv10"
+    return (
+        UV_CACHE_DIR / f"{stem}.grb2",
+        UV_CACHE_DIR / f"{stem}.json",
+    )
+
+
+def _read_uv_meta(meta_path: Path):
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _uv_cache_is_fresh(uv_path: Path, meta_path: Path):
+    if not uv_path.exists() or not meta_path.exists():
+        return False
+    age = time.time() - min(uv_path.stat().st_mtime, meta_path.stat().st_mtime)
+    return age < UV_CACHE_TTL
+
+
+def build_uv10_cache(fh: int, force: bool = False):
+    """
+    Extract only the 10 m U/V messages from the ~170 MB source GRIB2.
+    The compact two-message GRIB is then reused by /wind and /route-forecast.
+    This avoids rescanning the full source file on every request.
+    """
+    validate_fh(fh)
+    uv_path, meta_path = uv_cache_paths(fh)
+
+    if (not force) and _uv_cache_is_fresh(uv_path, meta_path):
+        meta = _read_uv_meta(meta_path)
+        if meta:
+            diag(
+                f"[UV_CACHE] hit fh={fh:03d} "
+                f"size_mb={uv_path.stat().st_size/1024/1024:.2f}"
+            )
+            return uv_path, meta
+
+    diag(f"[UV_CACHE] miss fh={fh:03d} force={force}; extracting 10m U/V")
+    source = download_grib(fh, force=force)
+    tmp = uv_path.with_suffix(".grb2.tmp")
+    tmp.unlink(missing_ok=True)
+
+    found = set()
+    meta = None
+    t0 = time.time()
+
+    try:
+        with open(source, "rb") as src, open(tmp, "wb") as out:
+            while True:
+                gid = codes_grib_new_from_file(src)
+                if gid is None:
+                    break
+                try:
+                    if meta is None:
+                        meta = {
+                            "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
+                            "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
+                            "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
+                        }
+
+                    comp = classify_uv_message(gid)
+                    if comp and comp not in found:
+                        codes_write(gid, out)
+                        found.add(comp)
+
+                    if "u" in found and "v" in found:
+                        break
+                finally:
+                    codes_release(gid)
+
+        if "u" not in found or "v" not in found:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(
+                502,
+                detail={
+                    "code": "UV10_NOT_FOUND",
+                    "message": f"10 m U/V wind fields were not found in {source.name}.",
+                },
+            )
+
+        tmp.replace(uv_path)
+
+        if not meta:
+            raise RuntimeError("No GRIB metadata found while extracting U/V")
+
+        meta["init_epoch"] = init_epoch(meta)
+        meta["forecast_hour"] = fh
+        meta["created_at_epoch"] = int(time.time())
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+        diag(
+            f"[UV_CACHE] built fh={fh:03d} "
+            f"uv_size_mb={uv_path.stat().st_size/1024/1024:.2f} "
+            f"elapsed={time.time()-t0:.1f}s"
+        )
+
+        # Source GRIB is large. The compact U/V cache is all later queries need.
+        if not KEEP_FULL_GRIB:
+            try:
+                source.unlink(missing_ok=True)
+                diag(f"[GRIB] released full source fh={fh:03d} after U/V extraction")
+            except Exception:
+                pass
+
+        return uv_path, meta
+
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def invalidate_uv_cache(fh: int):
+    uv_path, meta_path = uv_cache_paths(fh)
+    uv_path.unlink(missing_ok=True)
+    meta_path.unlink(missing_ok=True)
+
 
 
 def safe_get(gid, key, default=None):
@@ -403,9 +530,8 @@ def dir_text(deg: float) -> str:
 
 
 def read_model_init(lat: float = 23.5, lon: float = 121.0):
-    p0 = download_grib(0)
-    meta0, _, _ = read_uv(p0, lat, lon)
-    return init_epoch(meta0)
+    _, meta0 = build_uv10_cache(0)
+    return int(meta0["init_epoch"])
 
 
 
@@ -614,12 +740,15 @@ def read_uv_many(path: Path, coords):
 
 
 def load_uv_many_for_cycle(fh: int, coords, expected_init: int):
-    meta, u, v = read_uv_many(download_grib(fh), coords)
-    got_init = init_epoch(meta)
+    uv_path, meta = build_uv10_cache(fh)
+    got_init = int(meta["init_epoch"])
+    _, u, v = read_uv_many(uv_path, coords)
 
     if got_init != expected_init:
-        meta, u, v = read_uv_many(download_grib(fh, force=True), coords)
-        got_init = init_epoch(meta)
+        invalidate_uv_cache(fh)
+        uv_path, meta = build_uv10_cache(fh, force=True)
+        got_init = int(meta["init_epoch"])
+        _, u, v = read_uv_many(uv_path, coords)
 
     return {
         "fh": fh,
@@ -702,6 +831,9 @@ def health():
             "step": STEP_H,
         },
         "cache_dir": str(CACHE_DIR),
+        "uv_cache_dir": str(UV_CACHE_DIR),
+        "uv_cache_ttl_seconds": UV_CACHE_TTL,
+        "keep_full_grib": KEEP_FULL_GRIB,
         "cwa_fileapi_fallback_configured": bool(CWA_API_KEY),
         "note": "Health check does not download a GRIB2 file.",
     }
@@ -729,7 +861,8 @@ def diagnostics():
         "ok": True,
         "version": VERSION,
         "diagnostic_logging": True,
-        "message": "Route forecast progress is printed to Render logs.",
+        "uv10_compact_cache": True,
+        "message": "Route forecast progress and U/V cache hits are printed to Render logs.",
     }
 
 
@@ -977,6 +1110,12 @@ def route_forecast(
     max_head = max(available, key=lambda x: x["headwind_mps"], default=None)
     max_tail = max(available, key=lambda x: x["tailwind_mps"], default=None)
 
+    # Do not report a meaningless "max headwind = 0.0 m/s".
+    if max_head and max_head["headwind_mps"] <= 0.05:
+        max_head = None
+    if max_tail and max_tail["tailwind_mps"] <= 0.05:
+        max_tail = None
+
     summary = {
         "samples_total": len(output),
         "samples_available": len(available),
@@ -1001,6 +1140,11 @@ def route_forecast(
         "service": "wrf3km-api",
         "version": VERSION,
         "model": MODEL_NAME,
+        "performance": {
+            "uv10_compact_cache": True,
+            "uv_cache_ttl_seconds": UV_CACHE_TTL,
+            "full_grib_retained": KEEP_FULL_GRIB,
+        },
         "route": {
             "route_id": "current",
             "source": rc["source"],
@@ -1027,19 +1171,22 @@ def route_forecast(
 
 def load_uv_for_cycle(fh: int, lat: float, lon: float, expected_init: int):
     """
-    Read one forecast-hour file. If its model cycle does not match the
-    latest FH0 cycle, force-refresh it once before deciding it is stale.
+    Read one forecast-hour from the compact two-message U/V cache.
+    If its model cycle does not match FH0, force-refresh source + cache once.
     """
-    meta, u, v = read_uv(download_grib(fh), lat, lon)
-    got_init = init_epoch(meta)
+    uv_path, meta = build_uv10_cache(fh)
+    got_init = int(meta["init_epoch"])
+    meta_read, u, v = read_uv(uv_path, lat, lon)
 
     if got_init != expected_init:
-        meta, u, v = read_uv(download_grib(fh, force=True), lat, lon)
-        got_init = init_epoch(meta)
+        invalidate_uv_cache(fh)
+        uv_path, meta = build_uv10_cache(fh, force=True)
+        got_init = int(meta["init_epoch"])
+        meta_read, u, v = read_uv(uv_path, lat, lon)
 
     return {
         "fh": fh,
-        "meta": meta,
+        "meta": meta_read,
         "init": got_init,
         "u": u,
         "v": v,

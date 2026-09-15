@@ -1,41 +1,98 @@
-# WRF3KM Render V0.2.1 — GPX + ETA 沿線預報
+# WRF3KM Render V0.2.2 — 效能快取 + 摘要修正
 
-V0.2 延續 V0.1.1 已驗證成功的：
-- CWA WRF-3KM GRIB2
-- ecCodes
-- 10 m U/V
-- 4 近鄰格點 IDW
-- 6 小時預報間 U/V 時間插值
-- model cycle 換輪 fallback
+V0.2.2 延續 V0.2.1 的 GPX + ETA 沿線預報與完整 Render 診斷 Log，
+這一版主要解決已經實測確認的效能瓶頸。
 
-新增：
-- 讀取 GitHub 固定 `current.gpx`
-- GPX 里程與局部騎乘方向
-- 出發時間 + 平均速度 → 每個路段 ETA
-- 一次批次讀取需要的 GRIB forecast-hour，避免每 10 km 重掃一次檔案
-- 每個採樣點計算順風 / 逆風 / 側風
-- 整條路摘要（最大逆風、最大順風、降級點數、不可用點數）
+## 已確認的舊瓶頸
 
-## 路線來源
+CWA 每個 WRF3KM forecast-hour GRIB2 約 170 MB。
 
-預設直接共用你現有的：
+V0.2.1 實測：
+- 下載約 7–14 秒 / 檔
+- ecCodes 掃完整 GRIB 約 29–30 秒 / 檔
+
+因此即使只是改均速、出發時間或取樣間距，
+如果又重新掃完整 170 MB GRIB，會非常浪費時間。
+
+## V0.2.2 核心改良：10 m U/V compact cache
+
+第一次碰到某個 forecast hour：
 
 ```text
-https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx
+170 MB 完整 GRIB
+  ↓ 掃一次
+只萃取 10 m U + 10 m V
+  ↓
+寫成小型 *_uv10.grb2 快取
 ```
 
-所以即時觀測 API 與 WRF3KM 預報 API 使用同一份 `current.gpx`。
+之後 `/wind` 與 `/route-forecast` 都直接讀這個只含兩個訊息的 compact GRIB，
+不再每次重新掃 170 MB 原始檔。
 
-Render Environment Variable：
+Render Log 會看到：
 
 ```text
-CURRENT_ROUTE_URL=https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx
-ROUTE_CACHE_SECONDS=300
+[UV_CACHE] miss fh=006 ... extracting 10m U/V
+[UV_CACHE] built fh=006 ...
 ```
 
-## 更新部署
+之後同一 forecast hour 再查：
 
-把 V0.2 的檔案覆蓋 GitHub：
+```text
+[UV_CACHE] hit fh=006 ...
+```
+
+### 完整 GRIB 預設不保留
+
+萃取成功後，預設刪除 170 MB 原始檔，只保留小型 U/V cache，
+避免 Render 暫存空間被 3～5 個大型 GRIB 撐滿。
+
+環境變數：
+
+```text
+KEEP_FULL_GRIB=false
+UV_CACHE_TTL_SECONDS=1200
+```
+
+如果未來需要保留完整 GRIB 才改成 true。
+
+## 模式換輪防呆仍保留
+
+V0.1.1 的功能全部保留：
+
+- FH0/FH6 等不同 model cycle → 強制重新抓一次
+- 至少一個需要的 forecast hour 已更新 → degraded fallback
+- 不會把不同輪資料硬混在一起
+- 完全沒有安全資料才回 503
+
+compact U/V cache 也會跟著 model cycle 驗證，
+發現 cycle 不一致會清掉該 forecast hour 的 U/V cache 再重建。
+
+## 摘要修正
+
+舊版在整段路完全沒有逆風時可能顯示：
+
+```text
+max_headwind = 0.0 m/s at KM 0
+```
+
+V0.2.2 改成：
+
+```json
+"max_headwind": null
+```
+
+同理，如果整段沒有任何順風分量：
+
+```json
+"max_tailwind": null
+```
+
+避免把 0.0 m/s 當成有意義的最大值。
+
+## 部署
+
+直接覆蓋 GitHub：
 
 ```text
 wrf3km-api/
@@ -46,8 +103,8 @@ wrf3km-api/
 └─ README_部署說明.md
 ```
 
-Commit 後等同一個 `wrf3km-api` Render Service 自動部署。
-不用建立新的 Web Service。
+不需要建立新的 Render Web Service。
+Commit 後讓原本 `wrf3km-api` Auto Deploy。
 
 ## 測試
 
@@ -60,113 +117,17 @@ Commit 後等同一個 `wrf3km-api` Render Service 自動部署。
 應看到：
 
 ```json
-"version": "0.2.0"
+"version": "0.2.2"
 ```
 
-### 2. Route
+並且：
 
-```text
-/route
+```json
+"uv_cache_dir": "/tmp/wrf3km-cache/uv10",
+"keep_full_grib": false
 ```
 
-會回：
-- current.gpx 總長
-- GPX 點數
-- 路線來源
-
-### 3. 整條路線預報
-
-現在出發、平均 25 km/h、每 10 km 一點：
-
-```text
-/route-forecast?speed_kmh=25&step_km=10
-```
-
-指定出發時間（未寫 timezone 時視為台灣時間）：
-
-```text
-/route-forecast?departure=2026-09-16T04:00:00&speed_kmh=25&step_km=10
-```
-
-如果 URL 中使用 `+08:00`，`+` 建議 URL encode 成 `%2B`：
-
-```text
-/route-forecast?departure=2026-09-16T04:00:00%2B08:00&speed_kmh=25&step_km=10
-```
-
-只預報一段，例如 100–200 km：
-
-```text
-/route-forecast?departure=2026-09-16T04:00:00&speed_kmh=25&step_km=10&start_km=100&end_km=200
-```
-
-## 每個 sample 回傳
-
-- `km`
-- `lat`, `lon`
-- `heading_deg`
-- `eta_taipei`
-- `wind_speed_mps`
-- `wind_direction_deg`
-- `wind_direction_text`
-- `headwind_mps`
-- `tailwind_mps`
-- `crosswind_mps`
-- `wind_effect`
-- `source_hours_used`
-- `degraded`
-- `nearest_model_point_distance_km`
-
-## 效能設計
-
-整條 360 km 若 `step_km=10` 約 37 個採樣點。
-
-V0.2 不會對 37 個點各自重複打 `/wind`。
-它會先算出所有 ETA 所需的 forecast-hour，再讓每個 GRIB 檔只掃一次 U/V，
-同一份 U/V 場一次處理全部路線座標。
-
-這是後續做沿線地圖時必要的效能改善。
-
-## 下一步
-
-V0.2 API 測通後，可直接做前端：
-- 上方輸入出發時間 / 平均速度
-- GPX 地圖
-- 每 10/20/30 km 風箭頭
-- 順風綠、側風橘、逆風紅
-- 點測站/路段顯示 ETA 與 WRF3KM 預報
-
-
-## V0.2.1 診斷 Log
-
-這版不改核心預報算法，主要加入 Render 即時進度 Log。
-
-測 `/route-forecast` 時，Render Logs 會依序看到類似：
-
-```text
-[ROUTE_FORECAST] start ...
-[ROUTE] fetch start ...
-[ROUTE] fetch done ...
-[ROUTE_FORECAST] route ready samples=...
-[ROUTE_FORECAST] reading latest model cycle from FH000
-[GRIB] start fh=000 ...
-[GRIB] ready fh=000 ...
-[ECCODES] scan start file=M-A0064-000.grb2 coords=...
-[ECCODES] scan done ...
-[ROUTE_FORECAST] needed forecast hours=[0, 6, 12, ...]
-[ROUTE_FORECAST] fh=006 begin
-...
-[ROUTE_FORECAST] complete ... elapsed=...
-```
-
-因此如果網頁一直等待，可以直接從 Render Log 看出卡在：
-- route 下載
-- 某個 GRIB 檔下載
-- ecCodes 解碼
-- 某個 forecast hour
-- 或其實已完成
-
-部署後可先測：
+### 2. Diagnostics
 
 ```text
 /diagnostics
@@ -175,9 +136,47 @@ V0.2 API 測通後，可直接做前端：
 應看到：
 
 ```json
-{
-  "ok": true,
-  "version": "0.2.1",
-  "diagnostic_logging": true
-}
+"version": "0.2.2",
+"uv10_compact_cache": true
 ```
+
+### 3. 前 50 km
+
+```text
+/route-forecast?speed_kmh=25&step_km=10&start_km=0&end_km=50
+```
+
+第一次仍需要對 FH0/FH6/FH12 各掃一次完整 GRIB，
+所以第一次不會瞬間完成。
+
+但第一次建立 U/V cache 後，馬上用相同 forecast hours 再測一次：
+
+```text
+/route-forecast?speed_kmh=26&step_km=10&start_km=0&end_km=50
+```
+
+Log 應看到多個：
+
+```text
+[UV_CACHE] hit ...
+```
+
+第二次速度應大幅縮短。
+
+## 目前架構
+
+```text
+CWA WRF3KM full GRIB
+        ↓ 首次
+ecCodes 找 10m U/V
+        ↓
+compact U/V GRIB cache
+        ↓
+GPX 座標空間插值
+        ↓
+ETA 時間插值
+        ↓
+順 / 逆 / 側風
+```
+
+下一階段才適合接前端地圖與出發時間、均速、休息策略的 UI。
