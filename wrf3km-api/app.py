@@ -23,7 +23,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -88,6 +88,21 @@ app.add_middleware(
 )
 
 download_lock = threading.Lock()
+
+# V0.2.4: prevent two simultaneous requests from building the same
+# compact U/V cache file at the same time.
+_uv_build_locks_guard = threading.Lock()
+_uv_build_locks = {}
+
+
+def get_uv_build_lock(fh: int):
+    with _uv_build_locks_guard:
+        lock = _uv_build_locks.get(fh)
+        if lock is None:
+            lock = threading.Lock()
+            _uv_build_locks[fh] = lock
+        return lock
+
 
 
 def data_id(fh: int) -> str:
@@ -248,107 +263,169 @@ def _read_uv_meta(meta_path: Path):
 
 
 def _uv_cache_is_fresh(uv_path: Path, meta_path: Path, fh: int):
-    # FH000 is our "is there a new model cycle?" probe and keeps the TTL.
-    # Other hours stay cached until FH000 reveals a newer cycle; the cycle
-    # validation in load_*_for_cycle() will then invalidate/rebuild them.
+    # Reject partial/corrupt cache files before they can be reused.
     if not uv_path.exists() or not meta_path.exists():
         return False
+    try:
+        if uv_path.stat().st_size < 100_000:
+            return False
+    except Exception:
+        return False
+
+    meta = _read_uv_meta(meta_path)
+    if not meta or "init_epoch" not in meta:
+        return False
+
+    # FH000 is our "is there a new model cycle?" probe and keeps the TTL.
+    # Other hours stay cached until FH000 reveals a newer cycle.
     if fh != 0:
         return True
+
     age = time.time() - min(uv_path.stat().st_mtime, meta_path.stat().st_mtime)
     return age < UV_CACHE_TTL
 
 
 def build_uv10_cache(fh: int, force: bool = False):
     """
-    Extract only the 10 m U/V messages from the ~170 MB source GRIB2.
-    The compact two-message GRIB is then reused by /wind and /route-forecast.
-    This avoids rescanning the full source file on every request.
+    Extract only 10 m U/V from the large CWA GRIB2 file.
+
+    V0.2.4 concurrency safety:
+    - one in-process builder per forecast hour
+    - cache is re-checked after acquiring the lock
+    - unique temporary files avoid tmp-path collisions
+    - compact GRIB and metadata are atomically replaced
+    - undersized/corrupt cache files are never accepted
     """
     validate_fh(fh)
     uv_path, meta_path = uv_cache_paths(fh)
 
+    # Fast path before locking.
     if (not force) and _uv_cache_is_fresh(uv_path, meta_path, fh):
         meta = _read_uv_meta(meta_path)
-        if meta:
+        diag(
+            f"[UV_CACHE] hit fh={fh:03d} "
+            f"size_mb={uv_path.stat().st_size/1024/1024:.2f}"
+        )
+        return uv_path, meta
+
+    build_lock = get_uv_build_lock(fh)
+
+    diag(f"[UV_CACHE] waiting build lock fh={fh:03d}")
+    with build_lock:
+        # A concurrent request may have completed while we waited.
+        if (not force) and _uv_cache_is_fresh(uv_path, meta_path, fh):
+            meta = _read_uv_meta(meta_path)
             diag(
-                f"[UV_CACHE] hit fh={fh:03d} "
+                f"[UV_CACHE] hit-after-wait fh={fh:03d} "
                 f"size_mb={uv_path.stat().st_size/1024/1024:.2f}"
             )
             return uv_path, meta
 
-    diag(f"[UV_CACHE] miss fh={fh:03d} force={force}; extracting 10m U/V")
-    source = download_grib(fh, force=force)
-    tmp = uv_path.with_suffix(".grb2.tmp")
-    tmp.unlink(missing_ok=True)
+        # Remove stale/partial leftovers before a rebuild.
+        try:
+            if uv_path.exists() and uv_path.stat().st_size < 100_000:
+                diag(
+                    f"[UV_CACHE] removing corrupt cache fh={fh:03d} "
+                    f"size_bytes={uv_path.stat().st_size}"
+                )
+                uv_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+        except Exception:
+            uv_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
 
-    found = set()
-    meta = None
-    t0 = time.time()
+        diag(f"[UV_CACHE] miss fh={fh:03d} force={force}; extracting 10m U/V")
+        source = download_grib(fh, force=force)
 
-    try:
-        with open(source, "rb") as src, open(tmp, "wb") as out:
-            while True:
-                gid = codes_grib_new_from_file(src)
-                if gid is None:
-                    break
-                try:
-                    if meta is None:
-                        meta = {
-                            "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
-                            "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
-                            "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
-                        }
+        unique = f"{os.getpid()}.{threading.get_ident()}.{int(time.time()*1000)}"
+        tmp = uv_path.with_name(f"{uv_path.name}.{unique}.tmp")
+        meta_tmp = meta_path.with_name(f"{meta_path.name}.{unique}.tmp")
+        tmp.unlink(missing_ok=True)
+        meta_tmp.unlink(missing_ok=True)
 
-                    comp = classify_uv_message(gid)
-                    if comp and comp not in found:
-                        codes_write(gid, out)
-                        found.add(comp)
+        found = set()
+        meta = None
+        t0 = time.time()
 
-                    if "u" in found and "v" in found:
+        try:
+            with open(source, "rb") as src, open(tmp, "wb") as out:
+                while True:
+                    gid = codes_grib_new_from_file(src)
+                    if gid is None:
                         break
-                finally:
-                    codes_release(gid)
+                    try:
+                        if meta is None:
+                            meta = {
+                                "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
+                                "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
+                                "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
+                            }
 
-        if "u" not in found or "v" not in found:
-            tmp.unlink(missing_ok=True)
-            raise HTTPException(
-                502,
-                detail={
-                    "code": "UV10_NOT_FOUND",
-                    "message": f"10 m U/V wind fields were not found in {source.name}.",
-                },
+                        comp = classify_uv_message(gid)
+                        if comp and comp not in found:
+                            codes_write(gid, out)
+                            found.add(comp)
+
+                        if "u" in found and "v" in found:
+                            break
+                    finally:
+                        codes_release(gid)
+
+            if "u" not in found or "v" not in found:
+                raise HTTPException(
+                    502,
+                    detail={
+                        "code": "UV10_NOT_FOUND",
+                        "message": f"10 m U/V wind fields were not found in {source.name}.",
+                    },
+                )
+
+            if not tmp.exists() or tmp.stat().st_size < 100_000:
+                raise HTTPException(
+                    502,
+                    detail={
+                        "code": "UV10_CACHE_INVALID",
+                        "message": "Extracted U/V cache file is missing or unexpectedly small.",
+                        "size_bytes": tmp.stat().st_size if tmp.exists() else 0,
+                    },
+                )
+
+            if not meta:
+                raise RuntimeError("No GRIB metadata found while extracting U/V")
+
+            meta["init_epoch"] = init_epoch(meta)
+            meta["forecast_hour"] = fh
+            meta["created_at_epoch"] = int(time.time())
+
+            meta_tmp.write_text(
+                json.dumps(meta, ensure_ascii=False),
+                encoding="utf-8",
             )
 
-        tmp.replace(uv_path)
+            # Publish data first, metadata second. A cache is only considered
+            # valid when both exist and the data file passes minimum-size checks.
+            tmp.replace(uv_path)
+            meta_tmp.replace(meta_path)
 
-        if not meta:
-            raise RuntimeError("No GRIB metadata found while extracting U/V")
+            diag(
+                f"[UV_CACHE] built fh={fh:03d} "
+                f"uv_size_mb={uv_path.stat().st_size/1024/1024:.2f} "
+                f"elapsed={time.time()-t0:.1f}s"
+            )
 
-        meta["init_epoch"] = init_epoch(meta)
-        meta["forecast_hour"] = fh
-        meta["created_at_epoch"] = int(time.time())
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+            if not KEEP_FULL_GRIB:
+                try:
+                    source.unlink(missing_ok=True)
+                    diag(f"[GRIB] released full source fh={fh:03d} after U/V extraction")
+                except Exception:
+                    pass
 
-        diag(
-            f"[UV_CACHE] built fh={fh:03d} "
-            f"uv_size_mb={uv_path.stat().st_size/1024/1024:.2f} "
-            f"elapsed={time.time()-t0:.1f}s"
-        )
+            return uv_path, meta
 
-        # Source GRIB is large. The compact U/V cache is all later queries need.
-        if not KEEP_FULL_GRIB:
-            try:
-                source.unlink(missing_ok=True)
-                diag(f"[GRIB] released full source fh={fh:03d} after U/V extraction")
-            except Exception:
-                pass
-
-        return uv_path, meta
-
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            meta_tmp.unlink(missing_ok=True)
+            raise
 
 
 def invalidate_uv_cache(fh: int):
@@ -1097,6 +1174,7 @@ def health():
         "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
         "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
         "grid_index_cache": True,
+        "concurrency_safe_uv_cache": True,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
         "keep_full_grib": KEEP_FULL_GRIB,
         "cwa_fileapi_fallback_configured": bool(CWA_API_KEY),
@@ -1129,7 +1207,8 @@ def diagnostics():
         "uv10_compact_cache": True,
         "grid_index_cache": True,
         "fast_value_array_lookup": True,
-        "message": "Logs include U/V cache, GRIDMAP hits/misses and ECCODES_FAST timings.",
+        "concurrency_safe_uv_cache": True,
+        "message": "Logs include U/V cache locks, GRIDMAP hits/misses and ECCODES_FAST timings.",
     }
 
 
@@ -1429,6 +1508,7 @@ def route_forecast(
             "uv10_compact_cache": True,
             "grid_index_cache": True,
             "fast_value_array_lookup": True,
+            "concurrency_safe_uv_cache": True,
             "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
             "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
             "full_grib_retained": KEEP_FULL_GRIB,
