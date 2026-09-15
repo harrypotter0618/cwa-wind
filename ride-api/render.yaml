@@ -13,3 +13,11 @@ services:
         value: "300"
       - key: ROUTE_CACHE_SECONDS
         value: "300"
+      - key: ROUTE_BACK_KM
+        value: "5"
+      - key: ROUTE_AHEAD_KM
+        value: "10"
+      - key: ROUTE_CROSS_KM
+        value: "8"
+      - key: MAX_STATIONS
+        value: "5"

@@ -1,5 +1,5 @@
 
-import json, math, os, time
+import math, os, time
 from pathlib import Path
 import requests
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -20,7 +20,12 @@ RAIN_URL = "https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0002-001"
 CWA_CACHE_SECONDS = int(os.getenv("CWA_CACHE_SECONDS", "300"))
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "300"))
 
-app = FastAPI(title="CWA Ride API", version="0.2.0")
+ROUTE_BACK_KM = float(os.getenv("ROUTE_BACK_KM", "5"))
+ROUTE_AHEAD_KM = float(os.getenv("ROUTE_AHEAD_KM", "10"))
+ROUTE_CROSS_KM = float(os.getenv("ROUTE_CROSS_KM", "8"))
+MAX_STATIONS = int(os.getenv("MAX_STATIONS", "5"))
+
+app = FastAPI(title="CWA Ride API", version="0.3.0")
 
 R = 6371.0
 DIR16 = ["北","北北東","東北","東北東","東","東南東","東南","南南東",
@@ -99,7 +104,8 @@ def parse_gpx(data: bytes):
         if i:
             cum += hav(pts[i-1]["lat"],pts[i-1]["lon"],p["lat"],p["lon"])
         p["cum"]=cum
-        j=min(i+1,len(pts)-1); k=max(i-1,0)
+        j=min(i+1,len(pts)-1)
+        k=max(i-1,0)
         p["heading"]=bearing(pts[k]["lat"],pts[k]["lon"],pts[j]["lat"],pts[j]["lon"])
     return pts
 
@@ -109,10 +115,9 @@ def load_current_route(force=False):
         time.time()-_route_cache["ts"] < ROUTE_CACHE_SECONDS):
         return _route_cache
 
-    # persistent source: GitHub raw current.gpx
     if CURRENT_ROUTE_URL:
         try:
-            r=requests.get(CURRENT_ROUTE_URL, timeout=20, headers={"Cache-Control":"no-cache"})
+            r=requests.get(CURRENT_ROUTE_URL,timeout=20,headers={"Cache-Control":"no-cache"})
             if r.ok:
                 route=parse_gpx(r.content)
                 _route_cache={"ts":time.time(),"route":route,"source":"github"}
@@ -120,7 +125,6 @@ def load_current_route(force=False):
         except:
             pass
 
-    # fallback: runtime upload
     f=ROUTES_DIR/"current.gpx"
     if f.exists():
         route=parse_gpx(f.read_bytes())
@@ -131,16 +135,80 @@ def load_current_route(force=False):
 
 def locate(route,lat,lon):
     best=None
-    for p in route:
+    for i,p in enumerate(route):
         d=hav(lat,lon,p["lat"],p["lon"])
         if best is None or d<best["offroute_km"]:
-            best={"route_km":p["cum"],"heading":p["heading"],"offroute_km":d}
+            best={"route_km":p["cum"],"heading":p["heading"],"offroute_km":d,
+                  "lat":p["lat"],"lon":p["lon"],"index":i}
     return best
+
+def route_projection(route, station, current_km):
+    lo=current_km-ROUTE_BACK_KM
+    hi=current_km+ROUTE_AHEAD_KM
+    best=None
+    for p in route:
+        if p["cum"] < lo or p["cum"] > hi:
+            continue
+        d=hav(station["lat"],station["lon"],p["lat"],p["lon"])
+        if best is None or d<best["cross_km"]:
+            best={
+                "cross_km":d,
+                "route_km":p["cum"],
+                "along_km":p["cum"]-current_km,
+                "heading":p["heading"]
+            }
+    return best
+
+def select_route_stations(route, current, wind):
+    candidates=[]
+    for s in wind:
+        pr=route_projection(route,s,current["route_km"])
+        if not pr or pr["cross_km"] > ROUTE_CROSS_KM:
+            continue
+        gps_d=hav(current["lat"],current["lon"],s["lat"],s["lon"])
+        score = pr["cross_km"]*2.0 + abs(pr["along_km"])*0.35 + gps_d*0.05
+        candidates.append({**s,
+                           "gps_dist_km":gps_d,
+                           "route_cross_km":pr["cross_km"],
+                           "route_along_km":pr["along_km"],
+                           "route_heading":pr["heading"],
+                           "score":score})
+    candidates.sort(key=lambda x:x["score"])
+
+    selected=[]
+    for s in candidates:
+        duplicate=any(hav(s["lat"],s["lon"],q["lat"],q["lon"]) < 1.0 for q in selected)
+        if not duplicate:
+            selected.append(s)
+        if len(selected)>=MAX_STATIONS:
+            break
+
+    if len(selected)<3:
+        fallback=[]
+        for s in wind:
+            gps_d=hav(current["lat"],current["lon"],s["lat"],s["lon"])
+            if gps_d<=12:
+                fallback.append({**s,
+                                 "gps_dist_km":gps_d,
+                                 "route_cross_km":None,
+                                 "route_along_km":None,
+                                 "route_heading":current["heading"],
+                                 "score":100+gps_d})
+        fallback.sort(key=lambda x:x["score"])
+        existing={x["id"] for x in selected}
+        for s in fallback:
+            if s["id"] not in existing:
+                selected.append(s)
+                existing.add(s["id"])
+            if len(selected)>=MAX_STATIONS:
+                break
+    return selected
 
 def fetch_cwa():
     global _cwa_cache
     if time.time()-_cwa_cache["ts"] < CWA_CACHE_SECONDS and _cwa_cache["wind"]:
         return _cwa_cache["wind"], _cwa_cache["rain"]
+
     if not CWA_KEY:
         raise HTTPException(500,"CWA_API_KEY missing")
 
@@ -155,20 +223,24 @@ def fetch_cwa():
         if not c: continue
         rv=rain_value(st.get("RainfallElement",{}).get("Past1hr",{}).get("Precipitation"))
         if rv is None: continue
-        rain.append({"name":st.get("StationName",""),"lat":c[0],"lon":c[1],"rain1h":rv})
+        rain.append({"name":st.get("StationName",""),
+                     "lat":c[0],"lon":c[1],"rain1h":rv})
 
     wind=[]
     for st in wj.get("records",{}).get("Station",[]):
         c=get_wgs84(st)
         if not c: continue
         we=st.get("WeatherElement",{})
-        ws=valid_num(we.get("WindSpeed")); wd=valid_num(we.get("WindDirection"))
+        ws=valid_num(we.get("WindSpeed"))
+        wd=valid_num(we.get("WindDirection"))
         if ws is None or wd is None: continue
+
         nearest=None; nd=999
         for r in rain:
             d=hav(c[0],c[1],r["lat"],r["lon"])
-            if d < nd and d <= 10:
+            if d<nd and d<=10:
                 nearest=r; nd=d
+
         wind.append({
             "name":st.get("StationName",""),
             "id":st.get("StationId",""),
@@ -177,28 +249,37 @@ def fetch_cwa():
             "rain1h":nearest["rain1h"] if nearest else None,
             "rain_source":nearest["name"] if nearest else ""
         })
+
     _cwa_cache={"ts":time.time(),"wind":wind,"rain":rain}
     return wind,rain
 
-def vector_summary(stations,heading):
-    if not stations: return None
-    sx=sy=0.0; comps=[]; rains=[]
+def route_aware_summary(stations):
+    if not stations:
+        return None
+    sx=sy=0.0; heads=[]; tails=[]; crosses=[]; rains=[]
     for s in stations:
         to=rad((s["wd"]+180)%360)
         sx += math.sin(to)*s["ws"]
         sy += math.cos(to)*s["ws"]
-        comps.append(wind_parts(s["wd"],s["ws"],heading))
+        p=wind_parts(s["wd"],s["ws"],s["route_heading"])
+        heads.append(p["head"]); tails.append(p["tail"]); crosses.append(p["cross"])
         if s.get("rain1h") is not None:
             rains.append(s["rain1h"])
+
     n=len(stations)
     vx=sx/n; vy=sy/n
     avg=(vx*vx+vy*vy)**0.5
     wd=((math.degrees(math.atan2(vx,vy))+360)%360+180)%360
-    p=wind_parts(wd,avg,heading)
-    p["head"]=sum(x["head"] for x in comps)/n
-    p["tail"]=sum(x["tail"] for x in comps)/n
-    p["cross"]=sum(x["cross"] for x in comps)/n
-    return {"wd":wd,"avg":avg,"p":p,"rain":max(rains) if rains else None}
+    head=sum(heads)/n; tail=sum(tails)/n; cross=sum(crosses)/n
+
+    typ="側風"
+    if head>max(tail,0.7): typ="逆風"
+    elif tail>max(head,0.7): typ="順風"
+    elif tail>0.35: typ="側順風"
+    elif head>0.35: typ="側逆風"
+
+    return {"wd":wd,"avg":avg,"p":{"head":head,"tail":tail,"cross":cross,"type":typ},
+            "rain":max(rains) if rains else None}
 
 @app.get("/health")
 def health():
@@ -209,10 +290,11 @@ def health():
         route_ok=False; source=None
     return {
         "ok":True,
-        "version":"0.2.0",
+        "version":"0.3.0",
         "cwa_key_configured":bool(CWA_KEY),
         "current_route_available":route_ok,
-        "current_route_source":source
+        "current_route_source":source,
+        "station_selection":"route-aware"
     }
 
 @app.get("/route")
@@ -249,27 +331,32 @@ async def upload_current(file: UploadFile = File(...)):
 @app.get("/status")
 def status(lat:float, lon:float, route_id:str="current"):
     if route_id!="current":
-        raise HTTPException(400,"V0.2 fixed route_id is current")
+        raise HTTPException(400,"V0.3 fixed route_id is current")
 
     rc=load_current_route()
     route=rc["route"]
     here=locate(route,lat,lon)
-    heading=here["heading"]
+    current={**here,"lat":lat,"lon":lon}
 
     wind,_=fetch_cwa()
-    near=[{**s,"dist_km":hav(lat,lon,s["lat"],s["lon"])} for s in wind]
-    near=sorted(near,key=lambda x:x["dist_km"])[:5]
+    selected=select_route_stations(route,current,wind)
+    if not selected:
+        raise HTTPException(503,"No usable route-representative wind stations")
 
-    sm=vector_summary(near,heading)
-    if not sm:
-        raise HTTPException(503,"No usable wind stations")
-
+    sm=route_aware_summary(selected)
     wd=sm["wd"]; avg=sm["avg"]; p=sm["p"]; rain=sm["rain"]
-    speech=f"目前附近實況。主風{dir_text(wd)}，{wd:.0f}度，平均風速{avg:.1f}公尺每秒。目前為{p['type']}。"
+
+    speech=(f"目前附近實況。主風{dir_text(wd)}，{wd:.0f}度，"
+            f"平均風速{avg:.1f}公尺每秒。目前為{p['type']}。")
     if p["head"]>0.05: speech+=f"逆風分量{p['head']:.1f}公尺每秒。"
     if p["tail"]>0.05: speech+=f"順風分量{p['tail']:.1f}公尺每秒。"
     if p["cross"]>0.2: speech+=f"側風{p['cross']:.1f}公尺每秒。"
-    speech += "近一小時雨量資料不明。" if rain is None else ("近一小時無雨。" if rain<=0 else f"近一小時雨量{rain:.1f}毫米。")
+    if rain is None:
+        speech+="近一小時雨量資料不明。"
+    elif rain<=0:
+        speech+="近一小時無雨。"
+    else:
+        speech+=f"近一小時雨量{rain:.1f}毫米。"
 
     return {
         "ok":True,
@@ -277,9 +364,16 @@ def status(lat:float, lon:float, route_id:str="current"):
         "route_source":rc["source"],
         "route":{
             "km":round(here["route_km"],2),
-            "heading_deg":round(heading,1),
-            "heading_text":dir_text(heading),
+            "heading_deg":round(here["heading"],1),
+            "heading_text":dir_text(here["heading"]),
             "offroute_km":round(here["offroute_km"],2)
+        },
+        "station_selection":{
+            "mode":"route-aware",
+            "window_back_km":ROUTE_BACK_KM,
+            "window_ahead_km":ROUTE_AHEAD_KM,
+            "max_cross_km":ROUTE_CROSS_KM,
+            "selected_count":len(selected)
         },
         "wind":{
             "direction_deg":round(wd,1),
@@ -291,5 +385,20 @@ def status(lat:float, lon:float, route_id:str="current"):
             "cross_ms":round(p["cross"],2)
         },
         "rain":{"past_1h_mm":None if rain is None else round(rain,2)},
+        "stations":[
+            {
+                "name":s["name"],
+                "id":s["id"],
+                "wind_direction_deg":s["wd"],
+                "wind_speed_ms":s["ws"],
+                "gps_distance_km":round(s["gps_dist_km"],2),
+                "route_cross_km":None if s["route_cross_km"] is None else round(s["route_cross_km"],2),
+                "route_along_km":None if s["route_along_km"] is None else round(s["route_along_km"],2),
+                "route_heading_deg":round(s["route_heading"],1),
+                "route_heading_text":dir_text(s["route_heading"]),
+                "rain_1h_mm":s.get("rain1h"),
+                "rain_source":s.get("rain_source")
+            } for s in selected
+        ],
         "speech":speech
     }
