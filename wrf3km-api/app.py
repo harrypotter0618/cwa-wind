@@ -18,7 +18,7 @@ from eccodes import (
     codes_release,
 )
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -36,6 +36,13 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "1200"))
 MAX_CACHE_MB = int(os.getenv("MAX_CACHE_MB", "450"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
+
+CURRENT_ROUTE_URL = os.getenv(
+    "CURRENT_ROUTE_URL",
+    "https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx"
+).strip()
+ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "300"))
+_route_cache = {"ts": 0.0, "route": None, "source": None}
 
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 
@@ -386,6 +393,253 @@ def read_model_init(lat: float = 23.5, lon: float = 121.0):
     return init_epoch(meta0)
 
 
+
+# ---------- Route forecast helpers ----------
+
+EARTH_KM = 6371.0
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_KM * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def parse_gpx(data: bytes):
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(data)
+    pts = []
+    for el in root.iter():
+        if el.tag.endswith("trkpt") or el.tag.endswith("rtept"):
+            try:
+                pts.append({
+                    "lat": float(el.attrib["lat"]),
+                    "lon": float(el.attrib["lon"]),
+                })
+            except Exception:
+                pass
+
+    if len(pts) < 2:
+        raise ValueError("GPX contains fewer than 2 route points")
+
+    cum = 0.0
+    for i, pt in enumerate(pts):
+        if i > 0:
+            prev = pts[i - 1]
+            cum += haversine_km(prev["lat"], prev["lon"], pt["lat"], pt["lon"])
+        pt["cum"] = cum
+
+    for i, pt in enumerate(pts):
+        a = pts[max(0, i - 1)]
+        b = pts[min(len(pts) - 1, i + 1)]
+        pt["heading"] = bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+
+    return pts
+
+
+def load_current_route(force=False):
+    global _route_cache
+
+    if (
+        not force
+        and _route_cache["route"] is not None
+        and time.time() - _route_cache["ts"] < ROUTE_CACHE_SECONDS
+    ):
+        return _route_cache
+
+    if not CURRENT_ROUTE_URL:
+        raise HTTPException(
+            500,
+            detail={"code": "CURRENT_ROUTE_URL_MISSING"}
+        )
+
+    try:
+        r = requests.get(
+            CURRENT_ROUTE_URL,
+            timeout=30,
+            headers={
+                "User-Agent": f"wrf3km-render/{VERSION}",
+                "Cache-Control": "no-cache",
+            },
+        )
+        r.raise_for_status()
+        route = parse_gpx(r.content)
+    except Exception as e:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "ROUTE_DOWNLOAD_FAILED",
+                "message": str(e),
+                "route_url": CURRENT_ROUTE_URL,
+            },
+        )
+
+    _route_cache = {
+        "ts": time.time(),
+        "route": route,
+        "source": CURRENT_ROUTE_URL,
+    }
+    return _route_cache
+
+
+def route_point_at_km(route, target_km: float):
+    target_km = max(0.0, min(float(target_km), route[-1]["cum"]))
+
+    lo = 0
+    hi = len(route) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if route[mid]["cum"] < target_km:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    i2 = lo
+    if i2 == 0:
+        return {
+            "km": 0.0,
+            "lat": route[0]["lat"],
+            "lon": route[0]["lon"],
+            "heading": route[0]["heading"],
+        }
+
+    i1 = i2 - 1
+    a = route[i1]
+    b = route[i2]
+    span = b["cum"] - a["cum"]
+    t = 0.0 if span <= 1e-9 else (target_km - a["cum"]) / span
+
+    lat = a["lat"] + t * (b["lat"] - a["lat"])
+    lon = a["lon"] + t * (b["lon"] - a["lon"])
+    heading = bearing_deg(a["lat"], a["lon"], b["lat"], b["lon"])
+
+    return {
+        "km": target_km,
+        "lat": lat,
+        "lon": lon,
+        "heading": heading,
+    }
+
+
+def idw4_many(gid, coords):
+    values = []
+    point_sets = []
+    for lat, lon in coords:
+        value, points = idw4(gid, lat, lon)
+        values.append(value)
+        point_sets.append(points)
+    return values, point_sets
+
+
+def read_uv_many(path: Path, coords):
+    meta = None
+    found = {}
+
+    with open(path, "rb") as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                break
+            try:
+                if meta is None:
+                    meta = {
+                        "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
+                        "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
+                        "forecastTime": int(safe_get(gid, "forecastTime", 0) or 0),
+                    }
+
+                comp = classify_uv_message(gid)
+                if comp and comp not in found:
+                    values, point_sets = idw4_many(gid, coords)
+                    found[comp] = {
+                        "values": values,
+                        "points": point_sets,
+                    }
+
+                if "u" in found and "v" in found:
+                    break
+            finally:
+                codes_release(gid)
+
+    if not meta:
+        raise HTTPException(
+            502,
+            detail={"code": "EMPTY_GRIB", "message": f"No GRIB messages in {path.name}."},
+        )
+
+    if "u" not in found or "v" not in found:
+        raise HTTPException(
+            502,
+            detail={
+                "code": "UV10_NOT_FOUND",
+                "message": f"10 m U/V wind fields were not found in {path.name}.",
+            },
+        )
+
+    return meta, found["u"], found["v"]
+
+
+def load_uv_many_for_cycle(fh: int, coords, expected_init: int):
+    meta, u, v = read_uv_many(download_grib(fh), coords)
+    got_init = init_epoch(meta)
+
+    if got_init != expected_init:
+        meta, u, v = read_uv_many(download_grib(fh, force=True), coords)
+        got_init = init_epoch(meta)
+
+    return {
+        "fh": fh,
+        "init": got_init,
+        "u": u,
+        "v": v,
+        "matches_latest_cycle": got_init == expected_init,
+    }
+
+
+def wind_effect(wd: float, ws: float, heading: float):
+    raw = ws * math.cos(math.radians(wd - heading))
+    head = max(0.0, raw)
+    tail = max(0.0, -raw)
+    cross = abs(ws * math.sin(math.radians(wd - heading)))
+
+    if head > max(tail, 0.7):
+        typ = "逆風"
+    elif tail > max(head, 0.7):
+        typ = "順風"
+    elif tail > 0.35:
+        typ = "側順風"
+    elif head > 0.35:
+        typ = "側逆風"
+    else:
+        typ = "側風"
+
+    return {
+        "type": typ,
+        "head_mps": head,
+        "tail_mps": tail,
+        "cross_mps": cross,
+    }
+
+
+def parse_departure(value: Optional[str]):
+    if not value:
+        return int(time.time())
+    return parse_requested_time(None, value)
+
+
 @app.get("/")
 def root():
     return {
@@ -395,7 +649,9 @@ def root():
         "docs": "/docs",
         "health": "/health",
         "range": "/range",
+        "route": "/route",
         "wind_example": "/wind?lat=24.15&lon=120.68",
+        "route_forecast_example": "/route-forecast?speed_kmh=25&step_km=10",
     }
 
 
@@ -435,6 +691,273 @@ def forecast_range():
         "last_valid_time_taipei": iso_taipei(init + MAX_FH * 3600),
         "forecast_hours": AVAILABLE_HOURS,
         "output_interval_hours": STEP_H,
+    }
+
+
+
+@app.get("/route")
+def route_info():
+    rc = load_current_route(force=True)
+    route = rc["route"]
+    return {
+        "ok": True,
+        "route_id": "current",
+        "distance_km": round(route[-1]["cum"], 2),
+        "points": len(route),
+        "source": rc["source"],
+    }
+
+
+@app.get("/route-forecast")
+def route_forecast(
+    departure: Optional[str] = Query(
+        None,
+        description="ISO-8601 departure time. No timezone = Taiwan local time. Omit = now."
+    ),
+    speed_kmh: float = Query(25.0, ge=5.0, le=60.0),
+    step_km: float = Query(10.0, ge=2.0, le=50.0),
+    start_km: float = Query(0.0, ge=0.0),
+    end_km: Optional[float] = Query(None, ge=0.0),
+):
+    rc = load_current_route()
+    route = rc["route"]
+    route_distance = route[-1]["cum"]
+
+    if start_km > route_distance:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "START_KM_OUT_OF_ROUTE",
+                "route_distance_km": round(route_distance, 2),
+            },
+        )
+
+    final_km = route_distance if end_km is None else min(end_km, route_distance)
+    if final_km < start_km:
+        raise HTTPException(
+            400,
+            detail={"code": "END_KM_BEFORE_START_KM"},
+        )
+
+    departure_epoch = parse_departure(departure)
+
+    kms = []
+    k = start_km
+    while k < final_km - 1e-6:
+        kms.append(round(k, 6))
+        k += step_km
+    if not kms or abs(kms[-1] - final_km) > 1e-6:
+        kms.append(final_km)
+
+    route_samples = [route_point_at_km(route, k) for k in kms]
+
+    # ETA is based on distance travelled from start_km.
+    for sample in route_samples:
+        travelled = sample["km"] - start_km
+        sample["eta_epoch"] = departure_epoch + travelled / speed_kmh * 3600.0
+
+    coords = [(x["lat"], x["lon"]) for x in route_samples]
+
+    # Establish latest model cycle from FH0.
+    init = read_model_init(
+        route_samples[0]["lat"],
+        route_samples[0]["lon"]
+    )
+    model_end = init + MAX_FH * 3600
+
+    needed_hours = set()
+    time_specs = []
+
+    for sample in route_samples:
+        requested = sample["eta_epoch"]
+        requested_fh = (requested - init) / 3600.0
+
+        if requested_fh < 0:
+            time_specs.append({
+                "available": False,
+                "reason": "BEFORE_FORECAST_RANGE",
+                "requested_fh": requested_fh,
+            })
+            continue
+
+        if requested_fh > MAX_FH:
+            time_specs.append({
+                "available": False,
+                "reason": "AFTER_FORECAST_RANGE",
+                "requested_fh": requested_fh,
+            })
+            continue
+
+        lo = int(math.floor(requested_fh / STEP_H) * STEP_H)
+        hi = int(math.ceil(requested_fh / STEP_H) * STEP_H)
+        lo = max(0, min(MAX_FH, lo))
+        hi = max(0, min(MAX_FH, hi))
+
+        needed_hours.add(lo)
+        needed_hours.add(hi)
+        time_specs.append({
+            "available": True,
+            "requested_fh": requested_fh,
+            "lo": lo,
+            "hi": hi,
+        })
+
+    fields = {}
+    for fh in sorted(needed_hours):
+        fields[fh] = load_uv_many_for_cycle(fh, coords, init)
+
+    output = []
+    degraded_count = 0
+    unavailable_count = 0
+
+    for i, (sample, spec) in enumerate(zip(route_samples, time_specs)):
+        base = {
+            "km": round(sample["km"], 2),
+            "lat": round(sample["lat"], 6),
+            "lon": round(sample["lon"], 6),
+            "heading_deg": round(sample["heading"], 1),
+            "heading_text": dir_text(sample["heading"]),
+            "eta_taipei": iso_taipei(sample["eta_epoch"]),
+        }
+
+        if not spec["available"]:
+            unavailable_count += 1
+            output.append({
+                **base,
+                "available": False,
+                "reason": spec["reason"],
+            })
+            continue
+
+        lo = spec["lo"]
+        hi = spec["hi"]
+        rf = spec["requested_fh"]
+
+        low = fields[lo]
+        high = fields[hi]
+        low_ok = low["matches_latest_cycle"]
+        high_ok = high["matches_latest_cycle"]
+
+        degraded = False
+        fallback_reason = None
+
+        if lo == hi and low_ok:
+            u = low["u"]["values"][i]
+            v = low["v"]["values"][i]
+            used = [lo]
+            alpha = 0.0
+            point_sets = low["u"]["points"][i]
+
+        elif low_ok and high_ok:
+            alpha = (rf - lo) / (hi - lo)
+            u = low["u"]["values"][i] + alpha * (
+                high["u"]["values"][i] - low["u"]["values"][i]
+            )
+            v = low["v"]["values"][i] + alpha * (
+                high["v"]["values"][i] - low["v"]["values"][i]
+            )
+            used = [lo, hi]
+            point_sets = low["u"]["points"][i]
+
+        elif low_ok or high_ok:
+            degraded = True
+            degraded_count += 1
+            fallback_reason = "MODEL_CYCLE_ROLLOUT"
+
+            choices = []
+            if low_ok:
+                choices.append((abs(rf - lo), lo, low))
+            if high_ok:
+                choices.append((abs(rf - hi), hi, high))
+
+            _, chosen_fh, chosen = min(choices, key=lambda x: x[0])
+            u = chosen["u"]["values"][i]
+            v = chosen["v"]["values"][i]
+            used = [chosen_fh]
+            alpha = None
+            point_sets = chosen["u"]["points"][i]
+
+        else:
+            unavailable_count += 1
+            output.append({
+                **base,
+                "available": False,
+                "reason": "MODEL_FILES_NOT_SYNCHRONIZED",
+                "requested_source_hours": [lo, hi],
+            })
+            continue
+
+        ws, wd = wind_from_uv(u, v)
+        effect = wind_effect(wd, ws, sample["heading"])
+        nearest = min(point_sets, key=lambda x: x["distance_km"])
+
+        output.append({
+            **base,
+            "available": True,
+            "degraded": degraded,
+            "fallback_reason": fallback_reason,
+            "wind_speed_mps": round(ws, 3),
+            "wind_direction_deg": round(wd, 1),
+            "wind_direction_text": dir_text(wd),
+            "headwind_mps": round(effect["head_mps"], 3),
+            "tailwind_mps": round(effect["tail_mps"], 3),
+            "crosswind_mps": round(effect["cross_mps"], 3),
+            "wind_effect": effect["type"],
+            "requested_forecast_hour": round(rf, 3),
+            "source_hours_used": used,
+            "time_interpolation_alpha": None if alpha is None else round(alpha, 4),
+            "nearest_model_point_distance_km": round(nearest["distance_km"], 3),
+        })
+
+    available = [x for x in output if x.get("available")]
+    max_head = max(available, key=lambda x: x["headwind_mps"], default=None)
+    max_tail = max(available, key=lambda x: x["tailwind_mps"], default=None)
+
+    summary = {
+        "samples_total": len(output),
+        "samples_available": len(available),
+        "samples_degraded": degraded_count,
+        "samples_unavailable": unavailable_count,
+        "max_headwind": None if not max_head else {
+            "km": max_head["km"],
+            "eta_taipei": max_head["eta_taipei"],
+            "headwind_mps": max_head["headwind_mps"],
+            "wind_direction_text": max_head["wind_direction_text"],
+        },
+        "max_tailwind": None if not max_tail else {
+            "km": max_tail["km"],
+            "eta_taipei": max_tail["eta_taipei"],
+            "tailwind_mps": max_tail["tailwind_mps"],
+            "wind_direction_text": max_tail["wind_direction_text"],
+        },
+    }
+
+    return {
+        "ok": True,
+        "service": "wrf3km-api",
+        "version": VERSION,
+        "model": MODEL_NAME,
+        "route": {
+            "route_id": "current",
+            "source": rc["source"],
+            "distance_km": round(route_distance, 2),
+            "forecast_start_km": round(start_km, 2),
+            "forecast_end_km": round(final_km, 2),
+        },
+        "ride": {
+            "departure_taipei": iso_taipei(departure_epoch),
+            "speed_kmh": speed_kmh,
+            "step_km": step_km,
+            "estimated_arrival_taipei": iso_taipei(
+                departure_epoch + (final_km - start_km) / speed_kmh * 3600.0
+            ),
+        },
+        "model_cycle": {
+            "initial_time_taipei": iso_taipei(init),
+            "last_valid_time_taipei": iso_taipei(model_end),
+        },
+        "summary": summary,
+        "samples": output,
     }
 
 

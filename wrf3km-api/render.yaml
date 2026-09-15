@@ -14,3 +14,8 @@ services:
         value: "1200"
       - key: MAX_CACHE_MB
         value: "450"
+      - key: CURRENT_ROUTE_URL
+        value: "https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx"
+      - key: ROUTE_CACHE_SECONDS
+        value: "300"
+

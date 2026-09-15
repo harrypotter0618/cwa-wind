@@ -1,155 +1,137 @@
-# WRF3KM Render V0.1.1
+# WRF3KM Render V0.2 — GPX + ETA 沿線預報
 
-獨立的 Render Web Service，專門把中央氣象署 WRF-3KM GRIB2 轉成簡單的 JSON 風場 API。
+V0.2 延續 V0.1.1 已驗證成功的：
+- CWA WRF-3KM GRIB2
+- ecCodes
+- 10 m U/V
+- 4 近鄰格點 IDW
+- 6 小時預報間 U/V 時間插值
+- model cycle 換輪 fallback
 
-## GitHub 位置
+新增：
+- 讀取 GitHub 固定 `current.gpx`
+- GPX 里程與局部騎乘方向
+- 出發時間 + 平均速度 → 每個路段 ETA
+- 一次批次讀取需要的 GRIB forecast-hour，避免每 10 km 重掃一次檔案
+- 每個採樣點計算順風 / 逆風 / 側風
+- 整條路摘要（最大逆風、最大順風、降級點數、不可用點數）
 
-建議放在原本 repo：
+## 路線來源
 
-```text
-cwa-wind/
-├─ ride-api/       # 原本即時觀測 API，不要動
-└─ wrf3km-api/     # 把本資料夾內容放這裡
-   ├─ app.py
-   ├─ Dockerfile
-   ├─ requirements.txt
-   └─ render.yaml
-```
-
-## Render 新增服務
-
-建立「新的」Web Service，不要覆蓋 cwa-ride-api。
-
-建議設定：
+預設直接共用你現有的：
 
 ```text
-Name: wrf3km-api
-Repository: harrypotter0618/cwa-wind
-Branch: main
-Root Directory: wrf3km-api
-Runtime: Docker
-Health Check Path: /health
+https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx
 ```
 
-Environment Variables：
+所以即時觀測 API 與 WRF3KM 預報 API 使用同一份 `current.gpx`。
+
+Render Environment Variable：
 
 ```text
-CWA_API_KEY = 你的 CWA API key
-CORS_ORIGINS = *
-CACHE_TTL_SECONDS = 1200
-MAX_CACHE_MB = 450
+CURRENT_ROUTE_URL=https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx
+ROUTE_CACHE_SECONDS=300
 ```
 
-CWA_API_KEY 在 V0.1 是「備援下載」使用。
-程式會先嘗試官方資料集提供的 CWA S3 GRIB2 URI，失敗時才改用 fileapi。
+## 更新部署
 
-## 部署後依序測試
+把 V0.2 的檔案覆蓋 GitHub：
+
+```text
+wrf3km-api/
+├─ app.py
+├─ Dockerfile
+├─ requirements.txt
+├─ render.yaml
+└─ README_部署說明.md
+```
+
+Commit 後等同一個 `wrf3km-api` Render Service 自動部署。
+不用建立新的 Web Service。
+
+## 測試
 
 ### 1. Health
 
 ```text
-https://wrf3km-api.onrender.com/health
+/health
 ```
 
-成功應看到：
+應看到：
 
 ```json
-{
-  "ok": true,
-  "service": "wrf3km-api",
-  "version": "0.1.0",
-  "model": "CWA WRF-3KM"
-}
+"version": "0.2.0"
 ```
 
-這一步不下載大型 GRIB2，只確認 Render + Python + ecCodes 有正常啟動。
-
-### 2. Forecast range
+### 2. Route
 
 ```text
-https://wrf3km-api.onrender.com/range
+/route
 ```
 
-第一次會下載 M-A0064-000.grb2，所以會比 /health 慢。
+會回：
+- current.gpx 總長
+- GPX 點數
+- 路線來源
 
-成功後會看到：
-- 最新 model initial time
-- 可預報起始時間
-- 最後有效時間
-- 0, 6, 12 ... 84 小時
+### 3. 整條路線預報
 
-### 3. Wind
-
-例如台中：
+現在出發、平均 25 km/h、每 10 km 一點：
 
 ```text
-https://wrf3km-api.onrender.com/wind?lat=24.15&lon=120.68
+/route-forecast?speed_kmh=25&step_km=10
 ```
 
-沒有指定時間時，以「目前時間」為目標預報時間。
-
-也可以指定台灣時間：
+指定出發時間（未寫 timezone 時視為台灣時間）：
 
 ```text
-https://wrf3km-api.onrender.com/wind?lat=24.15&lon=120.68&time=2026-09-16T12:00:00%2B08:00
+/route-forecast?departure=2026-09-16T04:00:00&speed_kmh=25&step_km=10
 ```
 
-或 Unix epoch：
+如果 URL 中使用 `+08:00`，`+` 建議 URL encode 成 `%2B`：
 
 ```text
-/wind?lat=24.15&lon=120.68&time_epoch=1789521600
+/route-forecast?departure=2026-09-16T04:00:00%2B08:00&speed_kmh=25&step_km=10
 ```
 
-## V0.1 已做的事
+只預報一段，例如 100–200 km：
 
-- CWA WRF-3KM GRIB2 下載與快取
-- ecCodes 解析
-- 尋找 10 m U/V wind
-- 空間：4 個最近格點 IDW 加權
-- 時間：相鄰 6 小時預報 U/V 線性插值
-- U/V → 風速 + 氣象風向（FROM）
-- 模式切換期間偵測不同 cycle，避免混用兩次模式結果
-- CORS，可供 GitHub Pages 前端呼叫
-- 快取容量限制，避免 Render 暫存空間一直堆積
+```text
+/route-forecast?departure=2026-09-16T04:00:00&speed_kmh=25&step_km=10&start_km=100&end_km=200
+```
 
-## 目前刻意還沒做
+## 每個 sample 回傳
 
-V0.1 先驗證「Render 能否穩定下載 + 解析 WRF3KM」。
+- `km`
+- `lat`, `lon`
+- `heading_deg`
+- `eta_taipei`
+- `wind_speed_mps`
+- `wind_direction_deg`
+- `wind_direction_text`
+- `headwind_mps`
+- `tailwind_mps`
+- `crosswind_mps`
+- `wind_effect`
+- `source_hours_used`
+- `degraded`
+- `nearest_model_point_distance_km`
 
-等 /range 與 /wind 都通過，再做下一版：
-1. GPX + 出發時間 + ETA
-2. 沿路每 10/20/30 km 取樣
-3. 回傳整條路的風向、風速、順逆風
-4. 接到既有的 WRF3KM 預報地圖
+## 效能設計
 
-## 常見錯誤
+整條 360 km 若 `step_km=10` 約 37 個採樣點。
 
-### UV10_NOT_FOUND
-GRIB2 的 10 m U/V 欄位命名與預期不同。把 Render log 貼回來即可再修欄位判讀。
+V0.2 不會對 37 個點各自重複打 `/wind`。
+它會先算出所有 ETA 所需的 forecast-hour，再讓每個 GRIB 檔只掃一次 U/V，
+同一份 U/V 場一次處理全部路線座標。
 
-### CWA_DOWNLOAD_FAILED
-官方 S3 與 fileapi 都無法取得資料。檢查 CWA_API_KEY，以及 Render log 的 HTTP 回應。
+這是後續做沿線地圖時必要的效能改善。
 
-### MODEL_FILES_NOT_SYNCHRONIZED
-中央氣象署正在更新 6 小時一輪的新模式資料，不同 forecast-hour 檔案暫時屬於不同 cycle。
-這時不要硬混資料，幾分鐘後再試。
+## 下一步
 
-### Render 第一次很慢
-正常。GRIB2 比你現在 cwa-ride-api 使用的 JSON 大很多，而且 Free service 冷啟動後還要重新下載暫存資料。
-
-
-## V0.1.1：模式換輪不中斷
-
-V0.1.1 針對 `MODEL_FILES_NOT_SYNCHRONIZED` 加入兩層處理：
-
-1. 如果需要的 forecast-hour 檔案和最新 FH0 model cycle 不同，會先強制清除該檔快取並向 CWA 重抓一次。
-2. 重抓後若兩個來源小時仍不同步，但至少一個已屬於最新 model cycle，API 不再直接 503，而是使用「最接近目標時間、且屬於最新 cycle」的那一筆，並回傳：
-   - `degraded: true`
-   - `fallback_reason: MODEL_CYCLE_ROLLOUT`
-   - `source_hours_used`
-
-只有在重抓後兩個需要的 forecast-hour 都還沒有最新 cycle 可用時，才會保留 503。這種情況代表上游 CWA 尚未發布任何可安全使用的同輪資料，API 不會用錯輪資料硬算。
-
-正常同步完成後會自動恢復：
-- `degraded: false`
-- 兩個 6 小時來源正常做 U/V 時間插值
+V0.2 API 測通後，可直接做前端：
+- 上方輸入出發時間 / 平均速度
+- GPX 地圖
+- 每 10/20/30 km 風箭頭
+- 順風綠、側風橘、逆風紅
+- 點測站/路段顯示 ETA 與 WRF3KM 預報
