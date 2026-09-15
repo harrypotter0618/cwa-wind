@@ -1,4 +1,4 @@
-# WRF3KM Render V0.2 — GPX + ETA 沿線預報
+# WRF3KM Render V0.2.1 — GPX + ETA 沿線預報
 
 V0.2 延續 V0.1.1 已驗證成功的：
 - CWA WRF-3KM GRIB2
@@ -135,3 +135,49 @@ V0.2 API 測通後，可直接做前端：
 - 每 10/20/30 km 風箭頭
 - 順風綠、側風橘、逆風紅
 - 點測站/路段顯示 ETA 與 WRF3KM 預報
+
+
+## V0.2.1 診斷 Log
+
+這版不改核心預報算法，主要加入 Render 即時進度 Log。
+
+測 `/route-forecast` 時，Render Logs 會依序看到類似：
+
+```text
+[ROUTE_FORECAST] start ...
+[ROUTE] fetch start ...
+[ROUTE] fetch done ...
+[ROUTE_FORECAST] route ready samples=...
+[ROUTE_FORECAST] reading latest model cycle from FH000
+[GRIB] start fh=000 ...
+[GRIB] ready fh=000 ...
+[ECCODES] scan start file=M-A0064-000.grb2 coords=...
+[ECCODES] scan done ...
+[ROUTE_FORECAST] needed forecast hours=[0, 6, 12, ...]
+[ROUTE_FORECAST] fh=006 begin
+...
+[ROUTE_FORECAST] complete ... elapsed=...
+```
+
+因此如果網頁一直等待，可以直接從 Render Log 看出卡在：
+- route 下載
+- 某個 GRIB 檔下載
+- ecCodes 解碼
+- 某個 forecast hour
+- 或其實已完成
+
+部署後可先測：
+
+```text
+/diagnostics
+```
+
+應看到：
+
+```json
+{
+  "ok": true,
+  "version": "0.2.1",
+  "diagnostic_logging": true
+}
+```

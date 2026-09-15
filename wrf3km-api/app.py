@@ -1,6 +1,7 @@
 
 import datetime as dt
 import math
+import logging
 import os
 import threading
 import time
@@ -18,7 +19,7 @@ from eccodes import (
     codes_release,
 )
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -51,6 +52,17 @@ app = FastAPI(
     version=VERSION,
     description="Render backend for CWA WRF-3KM 10 m wind."
 )
+
+logger = logging.getLogger("wrf3km")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+def diag(msg: str):
+    logger.info(msg)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -158,6 +170,8 @@ def download_grib(fh: int, force: bool = False) -> Path:
             return p
 
         did = data_id(fh)
+        t0 = time.time()
+        diag(f"[GRIB] start fh={fh:03d} force={force} file={did}")
 
         if force:
             p.unlink(missing_ok=True)
@@ -198,6 +212,7 @@ def download_grib(fh: int, force: bool = False) -> Path:
             )
 
         cleanup_cache(keep=p)
+        diag(f"[GRIB] ready fh={fh:03d} size_mb={p.stat().st_size/1024/1024:.1f} elapsed={time.time()-t0:.1f}s")
         return p
 
 
@@ -467,6 +482,8 @@ def load_current_route(force=False):
         )
 
     try:
+        t0 = time.time()
+        diag(f"[ROUTE] fetch start url={CURRENT_ROUTE_URL}")
         r = requests.get(
             CURRENT_ROUTE_URL,
             timeout=30,
@@ -477,6 +494,7 @@ def load_current_route(force=False):
         )
         r.raise_for_status()
         route = parse_gpx(r.content)
+        diag(f"[ROUTE] fetch done points={len(route)} distance_km={route[-1]['cum']:.2f} elapsed={time.time()-t0:.1f}s")
     except Exception as e:
         raise HTTPException(
             502,
@@ -547,6 +565,8 @@ def idw4_many(gid, coords):
 def read_uv_many(path: Path, coords):
     meta = None
     found = {}
+    t0 = time.time()
+    diag(f"[ECCODES] scan start file={path.name} coords={len(coords)}")
 
     with open(path, "rb") as f:
         while True:
@@ -589,6 +609,7 @@ def read_uv_many(path: Path, coords):
             },
         )
 
+    diag(f"[ECCODES] scan done file={path.name} elapsed={time.time()-t0:.1f}s")
     return meta, found["u"], found["v"]
 
 
@@ -642,6 +663,13 @@ def parse_departure(value: Optional[str]):
 
 @app.get("/")
 def root():
+    diag(
+        f"[ROUTE_FORECAST] complete total={len(output)} "
+        f"available={len(available)} degraded={degraded_count} "
+        f"unavailable={unavailable_count} "
+        f"elapsed={time.time()-req_t0:.1f}s"
+    )
+
     return {
         "ok": True,
         "service": "wrf3km-api",
@@ -695,6 +723,16 @@ def forecast_range():
 
 
 
+@app.get("/diagnostics")
+def diagnostics():
+    return {
+        "ok": True,
+        "version": VERSION,
+        "diagnostic_logging": True,
+        "message": "Route forecast progress is printed to Render logs.",
+    }
+
+
 @app.get("/route")
 def route_info():
     rc = load_current_route(force=True)
@@ -719,6 +757,12 @@ def route_forecast(
     start_km: float = Query(0.0, ge=0.0),
     end_km: Optional[float] = Query(None, ge=0.0),
 ):
+    req_t0 = time.time()
+    diag(
+        f"[ROUTE_FORECAST] start departure={departure or 'now'} "
+        f"speed_kmh={speed_kmh} step_km={step_km} "
+        f"start_km={start_km} end_km={end_km}"
+    )
     rc = load_current_route()
     route = rc["route"]
     route_distance = route[-1]["cum"]
@@ -750,6 +794,11 @@ def route_forecast(
         kms.append(final_km)
 
     route_samples = [route_point_at_km(route, k) for k in kms]
+    diag(
+        f"[ROUTE_FORECAST] route ready samples={len(route_samples)} "
+        f"route_distance_km={route_distance:.2f} "
+        f"forecast_segment={start_km:.1f}-{final_km:.1f}km"
+    )
 
     # ETA is based on distance travelled from start_km.
     for sample in route_samples:
@@ -759,11 +808,16 @@ def route_forecast(
     coords = [(x["lat"], x["lon"]) for x in route_samples]
 
     # Establish latest model cycle from FH0.
+    diag("[ROUTE_FORECAST] reading latest model cycle from FH000")
     init = read_model_init(
         route_samples[0]["lat"],
         route_samples[0]["lon"]
     )
     model_end = init + MAX_FH * 3600
+    diag(
+        f"[ROUTE_FORECAST] model cycle init={iso_taipei(init)} "
+        f"valid_until={iso_taipei(model_end)}"
+    )
 
     needed_hours = set()
     time_specs = []
@@ -802,9 +856,19 @@ def route_forecast(
             "hi": hi,
         })
 
+    sorted_hours = sorted(needed_hours)
+    diag(f"[ROUTE_FORECAST] needed forecast hours={sorted_hours}")
+
     fields = {}
-    for fh in sorted(needed_hours):
+    for fh in sorted_hours:
+        fh_t0 = time.time()
+        diag(f"[ROUTE_FORECAST] fh={fh:03d} begin")
         fields[fh] = load_uv_many_for_cycle(fh, coords, init)
+        diag(
+            f"[ROUTE_FORECAST] fh={fh:03d} done "
+            f"cycle_ok={fields[fh]['matches_latest_cycle']} "
+            f"elapsed={time.time()-fh_t0:.1f}s"
+        )
 
     output = []
     degraded_count = 0
