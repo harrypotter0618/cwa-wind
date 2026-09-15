@@ -1,98 +1,103 @@
-# WRF3KM Render V0.2.2 — 效能快取 + 摘要修正
+# WRF3KM Render V0.2.3 — 格點索引快取版
 
-V0.2.2 延續 V0.2.1 的 GPX + ETA 沿線預報與完整 Render 診斷 Log，
-這一版主要解決已經實測確認的效能瓶頸。
+這版專門處理 V0.2.2 實測確認的最大瓶頸。
 
-## 已確認的舊瓶頸
+## V0.2.2 實測瓶頸
 
-CWA 每個 WRF3KM forecast-hour GRIB2 約 170 MB。
+compact U/V GRIB 已經成功把檔案從約 170 MB 縮到約 4.46 MB，
+但 6 個路線點每個 forecast hour 仍需約 28 秒。
 
-V0.2.1 實測：
-- 下載約 7–14 秒 / 檔
-- ecCodes 掃完整 GRIB 約 29–30 秒 / 檔
-
-因此即使只是改均速、出發時間或取樣間距，
-如果又重新掃完整 170 MB GRIB，會非常浪費時間。
-
-## V0.2.2 核心改良：10 m U/V compact cache
-
-第一次碰到某個 forecast hour：
+原因不是檔案大小，而是：
 
 ```text
-170 MB 完整 GRIB
-  ↓ 掃一次
-只萃取 10 m U + 10 m V
+每個座標 × U/V × 每個 forecast hour
+→ 重複 codes_grib_find_nearest()
+```
+
+## V0.2.3 新流程
+
+第一次遇到一組 GPX 取樣座標：
+
+```text
+GPX 座標
   ↓
-寫成小型 *_uv10.grb2 快取
+用 FH000 U10 找 4 個最近 WRF 格點
+  ↓
+保存：
+- grid index
+- 格點經緯度
+- 距離
+- IDW 權重
 ```
 
-之後 `/wind` 與 `/route-forecast` 都直接讀這個只含兩個訊息的 compact GRIB，
-不再每次重新掃 170 MB 原始檔。
-
-Render Log 會看到：
+之後：
 
 ```text
-[UV_CACHE] miss fh=006 ... extracting 10m U/V
-[UV_CACHE] built fh=006 ...
+FH000 / FH006 / FH012 / ...
+        ↓
+直接 codes_get_array("values")
+        ↓
+用已保存的 4 個 index + 權重取 U/V
 ```
 
-之後同一 forecast hour 再查：
+所以：
 
-```text
-[UV_CACHE] hit fh=006 ...
-```
+- U / V 共用同一組格點索引
+- 不同 forecast hour 共用
+- 改出發時間共用
+- 改均速共用
+- 同一 `start_km / end_km / step_km` 共用
+- `step_km=20` 若落在已計算過的 10 km 點，也可直接命中既有座標快取
 
-### 完整 GRIB 預設不保留
+## 準確度
 
-萃取成功後，預設刪除 170 MB 原始檔，只保留小型 U/V cache，
-避免 Render 暫存空間被 3～5 個大型 GRIB 撐滿。
+計算方式沒有改：
 
-環境變數：
+- 同一份 CWA WRF-3KM
+- 同一個 10 m U/V
+- 同樣 4 個最近格點
+- 同樣 inverse-distance-squared 權重
+- 同樣 6 小時 U/V 時間插值
+- 同樣 GPX heading 與順逆側風計算
 
-```text
-KEEP_FULL_GRIB=false
-UV_CACHE_TTL_SECONDS=1200
-```
+V0.2.3 只是把「4 個格點是哪四個、權重多少」記住，
+避免每個 forecast hour 重複找。
 
-如果未來需要保留完整 GRIB 才改成 true。
+若 grid fingerprint 或 index 出現異常，
+程式會自動 fallback 回 V0.2.2 的 `codes_grib_find_nearest()`，
+優先保證結果正確。
 
-## 模式換輪防呆仍保留
+## 另外修正
 
-V0.1.1 的功能全部保留：
+### 1. U/V cache 更合理
 
-- FH0/FH6 等不同 model cycle → 強制重新抓一次
-- 至少一個需要的 forecast hour 已更新 → degraded fallback
-- 不會把不同輪資料硬混在一起
-- 完全沒有安全資料才回 503
+FH000 仍以 `UV_CACHE_TTL_SECONDS` 定期重新確認新 model cycle。
 
-compact U/V cache 也會跟著 model cycle 驗證，
-發現 cycle 不一致會清掉該 forecast hour 的 U/V cache 再重建。
+但 FH006 / FH012 / FH018 等非 0 小時檔：
+- 不再固定每 20 分鐘失效
+- 保存到 FH000 偵測出新 model cycle 為止
+- cycle 不一致時才重建
 
-## 摘要修正
+因此同一輪模式重算不會一直重新下載大型 GRIB。
 
-舊版在整段路完全沒有逆風時可能顯示：
+### 2. 修正 `/` 隱藏錯誤
 
-```text
-max_headwind = 0.0 m/s at KM 0
-```
+V0.2.2 有一段完成診斷訊息誤放進 `/` root handler。
+V0.2.3 已移回 `/route-forecast` 正確位置。
 
-V0.2.2 改成：
+### 3. 保留 V0.2.2 摘要修正
+
+整段沒有逆風時：
 
 ```json
 "max_headwind": null
 ```
 
-同理，如果整段沒有任何順風分量：
-
-```json
-"max_tailwind": null
-```
-
-避免把 0.0 m/s 當成有意義的最大值。
+不會再顯示無意義的 0.0 m/s。
 
 ## 部署
 
-直接覆蓋 GitHub：
+直接用 V0.2.3 覆蓋 GitHub：
 
 ```text
 wrf3km-api/
@@ -103,12 +108,11 @@ wrf3km-api/
 └─ README_部署說明.md
 ```
 
-不需要建立新的 Render Web Service。
-Commit 後讓原本 `wrf3km-api` Auto Deploy。
+不用建立新的 Render Web Service。
 
 ## 測試
 
-### 1. Health
+### Health
 
 ```text
 /health
@@ -117,66 +121,36 @@ Commit 後讓原本 `wrf3km-api` Auto Deploy。
 應看到：
 
 ```json
-"version": "0.2.2"
+"version": "0.2.3",
+"grid_index_cache": true
 ```
 
-並且：
-
-```json
-"uv_cache_dir": "/tmp/wrf3km-cache/uv10",
-"keep_full_grib": false
-```
-
-### 2. Diagnostics
-
-```text
-/diagnostics
-```
-
-應看到：
-
-```json
-"version": "0.2.2",
-"uv10_compact_cache": true
-```
-
-### 3. 前 50 km
+### 前 50 km
 
 ```text
 /route-forecast?speed_kmh=25&step_km=10&start_km=0&end_km=50
 ```
 
-第一次仍需要對 FH0/FH6/FH12 各掃一次完整 GRIB，
-所以第一次不會瞬間完成。
+第一次應看到：
 
-但第一次建立 U/V cache 後，馬上用相同 forecast hours 再測一次：
+```text
+[GRIDMAP] coords=6 hit=0 miss=6
+[GRIDMAP] built ...
+[ECCODES_FAST] read ...
+```
+
+第二次改均速：
 
 ```text
 /route-forecast?speed_kmh=26&step_km=10&start_km=0&end_km=50
 ```
 
-Log 應看到多個：
+應看到：
 
 ```text
+[GRIDMAP] coords=6 hit=6 miss=0
 [UV_CACHE] hit ...
+[ECCODES_FAST] read done ... 
 ```
 
-第二次速度應大幅縮短。
-
-## 目前架構
-
-```text
-CWA WRF3KM full GRIB
-        ↓ 首次
-ecCodes 找 10m U/V
-        ↓
-compact U/V GRIB cache
-        ↓
-GPX 座標空間插值
-        ↓
-ETA 時間插值
-        ↓
-順 / 逆 / 側風
-```
-
-下一階段才適合接前端地圖與出發時間、均速、休息策略的 UI。
+理想狀況下第二次應比 V0.2.2 的每 FH 約 28 秒快非常多。
