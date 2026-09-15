@@ -1,4 +1,4 @@
-# WRF3KM Render V0.1
+# WRF3KM Render V0.1.1
 
 獨立的 Render Web Service，專門把中央氣象署 WRF-3KM GRIB2 轉成簡單的 JSON 風場 API。
 
@@ -136,3 +136,20 @@ GRIB2 的 10 m U/V 欄位命名與預期不同。把 Render log 貼回來即可�
 
 ### Render 第一次很慢
 正常。GRIB2 比你現在 cwa-ride-api 使用的 JSON 大很多，而且 Free service 冷啟動後還要重新下載暫存資料。
+
+
+## V0.1.1：模式換輪不中斷
+
+V0.1.1 針對 `MODEL_FILES_NOT_SYNCHRONIZED` 加入兩層處理：
+
+1. 如果需要的 forecast-hour 檔案和最新 FH0 model cycle 不同，會先強制清除該檔快取並向 CWA 重抓一次。
+2. 重抓後若兩個來源小時仍不同步，但至少一個已屬於最新 model cycle，API 不再直接 503，而是使用「最接近目標時間、且屬於最新 cycle」的那一筆，並回傳：
+   - `degraded: true`
+   - `fallback_reason: MODEL_CYCLE_ROLLOUT`
+   - `source_hours_used`
+
+只有在重抓後兩個需要的 forecast-hour 都還沒有最新 cycle 可用時，才會保留 503。這種情況代表上游 CWA 尚未發布任何可安全使用的同輪資料，API 不會用錯輪資料硬算。
+
+正常同步完成後會自動恢復：
+- `degraded: false`
+- 兩個 6 小時來源正常做 U/V 時間插值

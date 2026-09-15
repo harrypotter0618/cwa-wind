@@ -18,7 +18,7 @@ from eccodes import (
     codes_release,
 )
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -83,7 +83,11 @@ def _stream_download(url: str, dest: Path, params=None) -> tuple[bool, str]:
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
             stream=True,
-            headers={"User-Agent": f"wrf3km-render/{VERSION}"},
+            headers={
+                "User-Agent": f"wrf3km-render/{VERSION}",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
         ) as r:
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"
@@ -133,33 +137,37 @@ def cleanup_cache(keep: Optional[Path] = None):
             break
 
 
-def download_grib(fh: int) -> Path:
+def download_grib(fh: int, force: bool = False) -> Path:
     validate_fh(fh)
     p = cache_path(fh)
 
-    if p.exists() and time.time() - p.stat().st_mtime < CACHE_TTL:
+    if (not force) and p.exists() and time.time() - p.stat().st_mtime < CACHE_TTL:
         p.touch()
         return p
 
     with download_lock:
-        if p.exists() and time.time() - p.stat().st_mtime < CACHE_TTL:
+        if (not force) and p.exists() and time.time() - p.stat().st_mtime < CACHE_TTL:
             p.touch()
             return p
 
         did = data_id(fh)
 
-        # First try the direct official CWA S3 resource exposed by the dataset.
+        if force:
+            p.unlink(missing_ok=True)
+
+        # First try the direct official CWA S3 resource.
         direct_url = f"{DIRECT_BASE}/{did}.grb2"
-        ok, why = _stream_download(direct_url, p)
+        # A cache-busting query is used only for forced refreshes.
+        direct_params = {"_": int(time.time())} if force else None
+        ok, why = _stream_download(direct_url, p, params=direct_params)
 
         # Fallback to CWA file API when direct resource is unavailable.
         if not ok and CWA_API_KEY:
             fileapi_url = FILEAPI.format(dataid=did)
-            ok, why2 = _stream_download(
-                fileapi_url,
-                p,
-                params={"Authorization": CWA_API_KEY}
-            )
+            params = {"Authorization": CWA_API_KEY}
+            if force:
+                params["_"] = int(time.time())
+            ok, why2 = _stream_download(fileapi_url, p, params=params)
             if not ok:
                 raise HTTPException(
                     502,
@@ -430,6 +438,28 @@ def forecast_range():
     }
 
 
+def load_uv_for_cycle(fh: int, lat: float, lon: float, expected_init: int):
+    """
+    Read one forecast-hour file. If its model cycle does not match the
+    latest FH0 cycle, force-refresh it once before deciding it is stale.
+    """
+    meta, u, v = read_uv(download_grib(fh), lat, lon)
+    got_init = init_epoch(meta)
+
+    if got_init != expected_init:
+        meta, u, v = read_uv(download_grib(fh, force=True), lat, lon)
+        got_init = init_epoch(meta)
+
+    return {
+        "fh": fh,
+        "meta": meta,
+        "init": got_init,
+        "u": u,
+        "v": v,
+        "matches_latest_cycle": got_init == expected_init,
+    }
+
+
 @app.get("/wind")
 def wind(
     lat: float = Query(..., ge=14.0, le=32.2),
@@ -439,7 +469,7 @@ def wind(
 ):
     requested = parse_requested_time(time_epoch, time)
 
-    # fh=0 establishes the latest model cycle.
+    # FH0 establishes the newest model cycle currently published.
     init = read_model_init(lat, lon)
     requested_fh = (requested - init) / 3600.0
 
@@ -467,54 +497,97 @@ def wind(
     lo = max(0, min(MAX_FH, lo))
     hi = max(0, min(MAX_FH, hi))
 
-    meta_lo, u_lo, v_lo = read_uv(download_grib(lo), lat, lon)
-    init_lo = init_epoch(meta_lo)
+    degraded = False
+    warning = None
+    fallback_reason = None
 
-    if init_lo != init:
+    low = load_uv_for_cycle(lo, lat, lon, init)
+
+    if hi == lo:
+        high = low
+    else:
+        high = load_uv_for_cycle(hi, lat, lon, init)
+
+    low_ok = low["matches_latest_cycle"]
+    high_ok = high["matches_latest_cycle"]
+
+    if lo == hi and low_ok:
+        u = low["u"]["value"]
+        v = low["v"]["value"]
+        alpha = 0.0
+        used_hours = [lo]
+
+    elif low_ok and high_ok:
+        alpha = (requested_fh - lo) / (hi - lo)
+        u = low["u"]["value"] + alpha * (high["u"]["value"] - low["u"]["value"])
+        v = low["v"]["value"] + alpha * (high["v"]["value"] - low["v"]["value"])
+        used_hours = [lo, hi]
+
+    elif low_ok or high_ok:
+        # CWA is likely rolling from one model cycle to the next.
+        # Do not mix cycles. Use the closest source hour that already belongs
+        # to the latest cycle, and mark the response as degraded.
+        degraded = True
+        fallback_reason = "MODEL_CYCLE_ROLLOUT"
+        warning = (
+            "CWA model files are being updated. Time interpolation was disabled "
+            "and the nearest forecast hour from the latest model cycle was used."
+        )
+
+        candidates = []
+        if low_ok:
+            candidates.append((abs(requested_fh - lo), low))
+        if high_ok:
+            candidates.append((abs(requested_fh - hi), high))
+        _, chosen = min(candidates, key=lambda x: x[0])
+
+        u = chosen["u"]["value"]
+        v = chosen["v"]["value"]
+        alpha = None
+        used_hours = [chosen["fh"]]
+
+    else:
+        # Neither required source hour belongs to the newest cycle even after
+        # a forced refresh. There is no safe same-cycle value to return.
         raise HTTPException(
             503,
             detail={
                 "code": "MODEL_FILES_NOT_SYNCHRONIZED",
-                "message": f"{data_id(lo)} belongs to a different model cycle. Retry later.",
+                "message": (
+                    "CWA is still publishing the new WRF-3KM cycle. "
+                    "Both required forecast-hour files are stale even after refresh."
+                ),
+                "latest_cycle_taipei": iso_taipei(init),
+                "requested_source_hours": [lo, hi],
+                "source_cycles_taipei": {
+                    str(lo): iso_taipei(low["init"]),
+                    str(hi): iso_taipei(high["init"]),
+                },
+                "retry_later": True,
             },
         )
 
-    if hi == lo:
-        u = u_lo["value"]
-        v = v_lo["value"]
-        alpha = 0.0
-    else:
-        meta_hi, u_hi, v_hi = read_uv(download_grib(hi), lat, lon)
-        init_hi = init_epoch(meta_hi)
-        if init_hi != init:
-            raise HTTPException(
-                503,
-                detail={
-                    "code": "MODEL_FILES_NOT_SYNCHRONIZED",
-                    "message": f"{data_id(hi)} belongs to a different model cycle. Retry later.",
-                },
-            )
-
-        alpha = (requested_fh - lo) / (hi - lo)
-        u = u_lo["value"] + alpha * (u_hi["value"] - u_lo["value"])
-        v = v_lo["value"] + alpha * (v_hi["value"] - v_lo["value"])
-
     speed, direction = wind_from_uv(u, v)
 
-    representative_points = u_lo["points"]
+    representative_points = low["u"]["points"] if low_ok else high["u"]["points"]
     nearest = min(representative_points, key=lambda x: x["distance_km"])
 
     return {
         "ok": True,
         "model": MODEL_NAME,
+        "version": VERSION,
+        "degraded": degraded,
+        "warning": warning,
+        "fallback_reason": fallback_reason,
         "requested_time_utc": iso_utc(requested),
         "requested_time_taipei": iso_taipei(requested),
         "initial_time_utc": iso_utc(init),
         "initial_time_taipei": iso_taipei(init),
         "last_valid_time_taipei": iso_taipei(init + MAX_FH * 3600),
         "requested_forecast_hour": round(requested_fh, 3),
-        "source_hours": [lo, hi],
-        "time_interpolation_alpha": round(alpha, 4),
+        "requested_source_hours": [lo, hi],
+        "source_hours_used": used_hours,
+        "time_interpolation_alpha": None if alpha is None else round(alpha, 4),
         "spatial_interpolation": "IDW over 4 nearest model grid points",
         "nearest_model_point": {
             "lat": round(nearest["lat"], 5),
