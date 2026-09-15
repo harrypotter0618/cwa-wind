@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>CWA 騎乘即時風雨 V0.6.1 地圖版</title>
+<title>CWA 騎乘即時風雨 V0.6.2 地圖版</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--text:#111;--muted:#666;--line:#e8e8e8}
 *{box-sizing:border-box}
@@ -39,7 +39,7 @@ button.primary{font-weight:800;font-size:18px}
 <div class="wrap">
 
 <div class="card">
-  <div class="big">CWA 騎乘即時風雨 V0.6.1 地圖版</div>
+  <div class="big">CWA 騎乘即時風雨 V0.6.2 地圖版</div>
   <div class="muted">GPX 路線優先｜CWA 即時風雨｜沿線測站地圖｜語音播報</div>
 </div>
 
@@ -129,7 +129,7 @@ button.primary{font-weight:800;font-size:18px}
     <div><b>沿線測站地圖</b></div>
     <div class="row">
       <label style="display:flex;align-items:center;gap:6px"><input id="mapOnlyUsed" type="checkbox" checked style="width:auto">只顯示沿線採用站</label>
-      <button id="fitMapBtn">縮放到路線</button>
+      <button id="fitMapBtn">聚焦前方 40 km</button>
     </div>
   </div>
   <div id="map"></div>
@@ -168,7 +168,7 @@ let gpsTimer=null,cwaTimer=null,lastCwaFetch=null,nextCwaFetch=null,tracking=fal
 let analysisMode='heading';
 let route=[], routeSamples=[], currentRouteKm=null, currentRouteHeading=null;
 let lastVoiceSnapshot=null;
-let map=null, userMarker=null, routeLayer=null, stationLayer=null;
+let map=null, userMarker=null, routeLayer=null, stationLayer=null, mapUserMoved=false, mapInitialFocused=false;
 const $=id=>document.getElementById(id);
 const rad=x=>x*Math.PI/180,deg=x=>x*180/Math.PI,norm=x=>(x%360+360)%360;
 
@@ -301,6 +301,7 @@ function initMap(){
     maxZoom:19,attribution:'© OpenStreetMap'
   }).addTo(map);
   stationLayer=L.layerGroup().addTo(map);
+  map.on('movestart zoomstart',()=>{ if(mapInitialFocused) mapUserMoved=true; });
 
   const legend=L.control({position:'bottomright'});
   legend.onAdd=()=>{
@@ -399,21 +400,62 @@ function renderMap(){
       .addTo(stationLayer)
       .bindPopup(popupHtml(s,h));
   }
+
+  if(!mapInitialFocused && !mapUserMoved){
+    setTimeout(()=>{
+      focusMap(20);
+      mapInitialFocused=true;
+    },80);
+  }
+}
+
+function focusMap(aheadKm=20){
+  initMap();
+  if(!map||!currentPos)return;
+
+  const pts=[[currentPos.lat,currentPos.lon]];
+
+  if(routeSamples.length){
+    locateOnRoute();
+    if(currentRouteKm!==null){
+      const endKm=currentRouteKm+aheadKm;
+      for(const p of routeSamples){
+        if(p.cum>=currentRouteKm-1 && p.cum<=endKm)pts.push([p.lat,p.lon]);
+      }
+
+      const crossLim=+$('crossLimit').value;
+      for(const s of allStations){
+        const r=routeStationProjection(s);
+        if(r && r.ahead>=0 && r.ahead<=aheadKm && r.cross<=crossLim){
+          pts.push([s.lat,s.lon]);
+        }
+      }
+    }
+  }else{
+    const h=currentHeading();
+    if(h!==null){
+      for(const s of allStations){
+        const d=hav(currentPos.lat,currentPos.lon,s.lat,s.lon);
+        const b=bearing(currentPos.lat,currentPos.lon,s.lat,s.lon);
+        const ad=angDiff(b,h);
+        const along=d*Math.cos(rad(ad));
+        const cross=Math.abs(d*Math.sin(rad(ad)));
+        if(along>=0 && along<=aheadKm && cross<=+$('crossLimit').value){
+          pts.push([s.lat,s.lon]);
+        }
+      }
+    }
+  }
+
+  if(pts.length===1){
+    map.setView([currentPos.lat,currentPos.lon],12);
+  }else{
+    map.fitBounds(pts,{padding:[28,28],maxZoom:14});
+  }
 }
 
 function fitMap(){
-  initMap();
-  if(!map)return;
-  const pts=[];
-
-  if(currentPos)pts.push([currentPos.lat,currentPos.lon]);
-  if(route.length){
-    for(const p of route)pts.push([p.lat,p.lon]);
-  }else{
-    for(const s of allStations.slice(0,20))pts.push([s.lat,s.lon]);
-  }
-
-  if(pts.length)map.fitBounds(pts,{padding:[20,20],maxZoom:13});
+  focusMap(40);
 }
 
 function speechSupported(){
@@ -675,22 +717,23 @@ $('gpxFile').onchange=async e=>{
     route=parseGPX(await f.text());
     if(route.length<2)throw Error('GPX 沒有有效路線點');
     buildRouteSamples();
+    mapInitialFocused=false; mapUserMoved=false;
     analysisMode='route';
     const here=locateOnRoute();
     $('routeStatus').innerHTML=`<span class="ok"><b>GPX 已啟用，路線方向優先</b></span>｜${f.name}｜${route.at(-1).cum.toFixed(1)} km${here?`｜目前約 ${here.cum.toFixed(1)} km｜離路線 ${here.d.toFixed(1)} km`:''}`;
     render();
-    setTimeout(fitMap,100);
+    setTimeout(()=>focusMap(20),100);
   }catch(err){
-    route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;analysisMode='heading';
+    route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;mapInitialFocused=false;mapUserMoved=false;analysisMode='heading';
     $('routeStatus').innerHTML=`<span class="bad">${err.message}</span>`;
   }
 };
 $('clearRouteBtn').onclick=()=>{
-  route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;analysisMode='heading';
+  route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;mapInitialFocused=false;mapUserMoved=false;analysisMode='heading';
   $('gpxFile').value='';
   $('routeStatus').innerHTML='目前：無路線，使用 GPS heading';
   render();
-  setTimeout(fitMap,100);
+  setTimeout(()=>focusMap(20),100);
 };
 
 function saveKey(){try{if($('rememberKey').checked&&$('key').value.trim())localStorage.setItem(KEY_STORAGE,$('key').value.trim());else if(!$('rememberKey').checked)localStorage.removeItem(KEY_STORAGE)}catch(e){}}
