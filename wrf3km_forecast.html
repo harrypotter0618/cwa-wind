@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f172a">
-  <title>WRF3KM 騎乘風況預報 V0.3.1</title>
+  <title>WRF3KM 騎乘風況預報</title>
   <style>
     :root{
       --bg:#0b1220;--panel:#111827;--panel2:#0f172a;--line:#263244;
@@ -73,6 +73,12 @@
     .status.error{display:block;background:#3f1115;border-color:#7f1d1d;color:#fecaca}
     .api-state{font-size:12px;color:#94a3b8;margin-top:5px}
     .api-ok{color:#86efac}.api-bad{color:#fca5a5}
+    .forecast-range{
+      margin-top:12px;padding:10px 12px;border-radius:10px;
+      background:#0b2239;border:1px solid #164e63;color:#bae6fd;font-size:12px;line-height:1.6
+    }
+    .forecast-range.warn{background:#3b2a08;border-color:#854d0e;color:#fde68a}
+    .forecast-range.error{background:#3f1115;border-color:#7f1d1d;color:#fecaca}
     .summary-grid{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:10px}
     .card{background:var(--panel2);border:1px solid #233044;border-radius:13px;padding:12px;min-height:90px}
     .card .k{font-size:12px;color:var(--muted);margin-bottom:5px}
@@ -131,7 +137,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.3.1</div>
+    <div class="version">UI V0.3.3</div>
   </header>
 
   <section class="panel">
@@ -196,6 +202,8 @@
         <input id="routeDistanceInput" value="—" disabled>
       </div>
     </div>
+
+    <div id="rangeInfo" class="forecast-range">正在讀取 WRF3KM 可用預報時段…</div>
 
     <div class="toggle-row">
       <input id="customSegmentToggle" type="checkbox">
@@ -294,6 +302,7 @@
   let temporaryDistanceKm = null;
   let currentDistanceKm = null;
   let lastData = null;
+  let forecastRange = null;
   const state = {alongHit:[], speedHit:[]};
 
   function taipeiPartsNow(){
@@ -318,6 +327,162 @@
 
   function activeDistance(){
     return routeMode==='upload' ? temporaryDistanceKm : currentDistanceKm;
+  }
+
+  function fmtTaipeiInputDate(d){
+    return new Intl.DateTimeFormat('sv-SE',{
+      timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit'
+    }).format(d);
+  }
+
+  function fmtTaipeiInputTime(d){
+    return new Intl.DateTimeFormat('sv-SE',{
+      timeZone:'Asia/Taipei',hour:'2-digit',minute:'2-digit',hour12:false
+    }).format(d);
+  }
+
+  function fmtFullTaipei(d){
+    return new Intl.DateTimeFormat('zh-TW',{
+      timeZone:'Asia/Taipei',month:'2-digit',day:'2-digit',
+      hour:'2-digit',minute:'2-digit',hour12:false
+    }).format(d);
+  }
+
+  function selectedSegmentDistance(){
+    const d=activeDistance();
+    if(!Number.isFinite(d)) return null;
+    if(!$('customSegmentToggle').checked) return d;
+    const a=Number($('startKm').value), b=Number($('endKm').value);
+    if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a) return null;
+    return Math.max(0,Math.min(b,d)-Math.min(a,d));
+  }
+
+  function selectedDepartureDate(){
+    const iso=departureIso();
+    if(!iso) return null;
+    const d=new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function updateDateTimeLimits(){
+    if(!forecastRange) return;
+    const dateEl=$('departureDate'), timeEl=$('departureTime');
+    const first=forecastRange.first, last=forecastRange.last;
+    const dist=selectedSegmentDistance();
+    const speed=Number($('speed').value);
+    const durationMs=(Number.isFinite(dist)&&speed>0) ? dist/speed*3600000 : 0;
+    const latestDeparture=new Date(last.getTime()-durationMs);
+
+    dateEl.min=fmtTaipeiInputDate(first);
+    dateEl.max=fmtTaipeiInputDate(latestDeparture);
+
+    const chosen=dateEl.value;
+    timeEl.removeAttribute('min');
+    timeEl.removeAttribute('max');
+    if(chosen===dateEl.min) timeEl.min=fmtTaipeiInputTime(first);
+    if(chosen===dateEl.max) timeEl.max=fmtTaipeiInputTime(latestDeparture);
+  }
+
+  function updateForecastWindow(){
+    const el=$('rangeInfo');
+    if(!forecastRange){
+      el.className='forecast-range';
+      el.textContent='正在讀取 WRF3KM 可用預報時段…';
+      return;
+    }
+
+    updateDateTimeLimits();
+
+    const first=forecastRange.first;
+    const last=forecastRange.last;
+    const dist=selectedSegmentDistance();
+    const speed=Number($('speed').value);
+
+    let header;
+    if(forecastRange.confirmed){
+      const fh=forecastRange.latestConfirmedHour;
+      header=`最新模式批次：${fmtFullTaipei(first)}\n`+
+             `本輪已確認發布：FH${String(fh ?? '?').padStart(3,'0')} → ${fmtFullTaipei(forecastRange.confirmed)}`;
+      if(forecastRange.theoretical){
+        header += `\n理論最遠：FH${String(forecastRange.theoreticalMaxHour).padStart(3,'0')} → ${fmtFullTaipei(forecastRange.theoretical)}`;
+      }
+      if(forecastRange.publishingComplete===false){
+        header += '\nCWA 此模式批次仍在發布中；時間選擇已依「實際確認範圍」限制。';
+      }else if(forecastRange.publishingComplete===true){
+        header += '\n本輪已完整發布。';
+      }
+    }else{
+      header=`模式批次：${fmtFullTaipei(first)}\n`;
+      if(forecastRange.theoretical){
+        header += `理論可到：${fmtFullTaipei(forecastRange.theoretical)}\n`;
+      }
+      header += '目前無法驗證最新一輪實際發布到哪個 FH；以下時間限制僅供參考。';
+    }
+
+    let msg=header;
+
+    if(Number.isFinite(dist)&&speed>0&&last){
+      const durationH=dist/speed;
+      const latestDeparture=new Date(last.getTime()-durationH*3600000);
+      msg += `\n依目前 ${dist.toFixed(1)} km / ${speed.toFixed(1)} km/h，預估騎乘 ${durationH.toFixed(1)} 小時；最晚可出發約 ${fmtFullTaipei(latestDeparture)}。`;
+
+      const dep=selectedDepartureDate();
+      if(dep){
+        const arrival=new Date(dep.getTime()+durationH*3600000);
+        if(dep<first){
+          el.className='forecast-range error';
+          el.textContent=msg+`\n目前出發時間早於本輪模式起始時間。`;
+          return;
+        }
+        if(arrival>last){
+          el.className='forecast-range error';
+          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，已超過「本輪實際確認可用」時間。`;
+          return;
+        }
+        const remainingH=(last-arrival)/3600000;
+        el.className=remainingH<6?'forecast-range warn':'forecast-range';
+        el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，仍在已確認可用範圍內。`;
+        return;
+      }
+    }
+
+    el.className=forecastRange.confirmed?'forecast-range':'forecast-range warn';
+    el.textContent=msg;
+  }
+
+  async function loadForecastRange(){
+    try{
+      const r=await fetchJson(`${API_BASE}/range`);
+      const first=new Date(r.first_valid_time_taipei);
+      const confirmedRaw=r.confirmed_last_valid_time_taipei || r.last_valid_time_taipei;
+      const theoreticalRaw=r.theoretical_last_valid_time_taipei || r.last_valid_time_taipei;
+      const confirmed=confirmedRaw ? new Date(confirmedRaw) : null;
+      const theoretical=theoreticalRaw ? new Date(theoreticalRaw) : null;
+
+      if(Number.isNaN(first.getTime())) throw new Error('模式起始時間格式無效');
+      if(confirmed && Number.isNaN(confirmed.getTime())) throw new Error('確認預報終點格式無效');
+      if(theoretical && Number.isNaN(theoretical.getTime())) throw new Error('理論預報終點格式無效');
+
+      forecastRange={
+        first,
+        last: confirmed || theoretical,
+        confirmed,
+        theoretical,
+        latestConfirmedHour: r.latest_confirmed_hour,
+        theoreticalMaxHour: r.theoretical_max_forecast_hour ?? 84,
+        publishingComplete: r.publishing_complete,
+        verificationMethod: r.verification_method,
+        verificationError: r.verification_error || null,
+        outputIntervalHours:r.output_interval_hours
+      };
+
+      updateForecastWindow();
+    }catch(e){
+      forecastRange=null;
+      const el=$('rangeInfo');
+      el.className='forecast-range error';
+      el.textContent='無法讀取 WRF3KM 可用預報時段：'+e.message;
+    }
   }
 
   function setStatus(msg,error=false){
@@ -364,6 +529,7 @@
       $('currentDistance').textContent=`${currentDistanceKm.toFixed(2)} km`;
       $('currentSource').textContent=d.source || 'GitHub current.gpx';
       if(routeMode==='current') updateRouteUI();
+      updateForecastWindow();
     }catch(e){
       $('currentDistance').textContent='讀取失敗';
       setStatus('current.gpx 路線資訊讀取失敗：'+e.message,true);
@@ -406,6 +572,7 @@
     const d=activeDistance();
     $('routeDistanceInput').value=Number.isFinite(d)?`${d.toFixed(2)} km`:'—';
     if(Number.isFinite(d)) $('endKm').value=d.toFixed(1);
+    updateForecastWindow();
   }
 
   function useCurrent(){
@@ -424,6 +591,7 @@
       $('uploadMeta').innerHTML=`<strong>${escapeHtml(file.name)}</strong><br>約 ${info.distance.toFixed(2)} km · ${info.points} 點`;
       $('clearUploadBtn').disabled=false;
       updateRouteUI();
+      updateForecastWindow();
       setStatus('臨時 GPX 已載入。按「計算預報」時才會上傳給 Render；不會覆蓋 current.gpx。');
     }catch(e){
       temporaryFile=null;temporaryDistanceKm=null;
@@ -439,6 +607,7 @@
     $('uploadMeta').textContent='尚未選擇檔案';
     $('clearUploadBtn').disabled=true;
     useCurrent();
+    updateForecastWindow();
   }
 
   function escapeHtml(s){
@@ -474,6 +643,7 @@
 
   function toggleSegment(){
     $('customSegment').classList.toggle('hidden',!$('customSegmentToggle').checked);
+    updateForecastWindow();
   }
 
   function validateSettings(){
@@ -488,6 +658,24 @@
       const a=Number($('startKm').value),b=Number($('endKm').value),d=activeDistance();
       if(!(a>=0&&b>a)) throw new Error('自訂起訖里程有誤');
       if(Number.isFinite(d)&&a>d) throw new Error('起始里程超過路線總長');
+    }
+
+    if(forecastRange){
+      const dep=selectedDepartureDate();
+      const dist=selectedSegmentDistance();
+      const durationH=dist/speed;
+      const arrival=new Date(dep.getTime()+durationH*3600000);
+      const latestDeparture=new Date(forecastRange.last.getTime()-durationH*3600000);
+
+      if(dep<forecastRange.first){
+        throw new Error(`出發時間太早。目前模式從 ${fmtFullTaipei(forecastRange.first)} 才開始有效。`);
+      }
+      if(dep>latestDeparture || arrival>forecastRange.last){
+        throw new Error(
+          `超出目前已確認發布的 WRF3KM 時段。依目前路線與速度，最晚出發約 ${fmtFullTaipei(latestDeparture)}；`+
+          `你目前設定預估抵達 ${fmtFullTaipei(arrival)}，但本輪目前只確認到 ${fmtFullTaipei(forecastRange.last)}。`
+        );
+      }
     }
   }
 
@@ -604,7 +792,7 @@
       ['路線來源',source,`${data.route?.distance_km??'—'} km`],
       ['預報區段',`${data.route?.forecast_start_km??0}–${data.route?.forecast_end_km??'—'} km`,`取樣 ${s.samples_available??0}/${s.samples_total??0}`],
       ['出發 / 抵達',fmtDateTime(ride.departure_taipei),`抵達 ${fmtDateTime(ride.estimated_arrival_taipei)} · 約 ${durationH.toFixed(1)} h`],
-      ['模式批次',fmtDateTime(cycle.initial_time_taipei),`有效至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
+      ['模式批次',fmtDateTime(cycle.initial_time_taipei),`本次計算模型範圍至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
       ['預報提前量',`${fmtLead(depLead)} → ${fmtLead(arrLead)}`,`<span class="${band.cls}">使用提示：${band.label}</span>`],
       ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
       ['最大逆風',maxHead,s.max_headwind?`${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}`:'—'],
@@ -721,14 +909,17 @@
   }
 
   $('runBtn').addEventListener('click',runForecast);
-  $('nowBtn').addEventListener('click',()=>{setNow();saveSettings()});
+  $('nowBtn').addEventListener('click',()=>{setNow();saveSettings();updateForecastWindow()});
   $('csvBtn').addEventListener('click',downloadCSV);
   $('useCurrentBtn').addEventListener('click',useCurrent);
   $('refreshRouteBtn').addEventListener('click',refreshCurrentRoute);
   $('clearUploadBtn').addEventListener('click',clearUpload);
   $('gpxFile').addEventListener('change',e=>chooseUpload(e.target.files?.[0]));
-  $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings()});
-  ['departureDate','departureTime','speed','step','startKm','endKm'].forEach(id=>$(id).addEventListener('change',saveSettings));
+  $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings();updateForecastWindow()});
+  ['departureDate','departureTime','speed','step','startKm','endKm'].forEach(id=>{
+    $(id).addEventListener('change',()=>{saveSettings();updateForecastWindow()});
+    $(id).addEventListener('input',()=>updateForecastWindow());
+  });
 
   bindTooltip('alongChart','alongHit');
   bindTooltip('speedChart','speedHit');
@@ -742,6 +933,7 @@
 
   loadSettings();
   checkApi();
+  loadForecastRange();
   refreshCurrentRoute();
   updateRouteUI();
 })();
