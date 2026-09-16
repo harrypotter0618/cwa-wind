@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import threading
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -60,6 +61,9 @@ CURRENT_ROUTE_URL = os.getenv(
 ).strip()
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "300"))
 MAX_GPX_UPLOAD_MB = int(os.getenv("MAX_GPX_UPLOAD_MB", "12"))
+RANGE_PROBE_CACHE_SECONDS = int(os.getenv("RANGE_PROBE_CACHE_SECONDS", "300"))
+RANGE_PROBE_MAX_FIRST_MESSAGE_MB = int(os.getenv("RANGE_PROBE_MAX_FIRST_MESSAGE_MB", "64"))
+_range_probe_cache = {"ts": 0.0, "result": None}
 _route_cache = {"ts": 0.0, "route": None, "source": None}
 
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
@@ -788,6 +792,290 @@ def dir_text(deg: float) -> str:
     return DIR16[round(deg / 22.5) % 16]
 
 
+
+def _read_limited_response_bytes(url: str, params, byte_count: int):
+    """
+    Read only the first byte_count bytes and close the response.
+    If the origin ignores HTTP Range and returns the full ~170 MB object,
+    we still stop reading after byte_count bytes.
+    """
+    headers = {
+        "User-Agent": f"wrf3km-render/{VERSION}",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Accept-Encoding": "identity",
+        "Range": f"bytes=0-{max(0, byte_count-1)}",
+    }
+    with requests.get(
+        url,
+        params=params,
+        timeout=min(REQUEST_TIMEOUT, 45),
+        allow_redirects=True,
+        stream=True,
+        headers=headers,
+    ) as r:
+        if r.status_code not in (200, 206):
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.raw.read(byte_count)
+        if len(data) < byte_count:
+            # A complete first GRIB message can legitimately be smaller only
+            # when byte_count is the requested total length. The caller validates.
+            return data
+        return data
+
+
+def _fetch_first_grib_message(fh: int):
+    """
+    Fetch only the first GRIB2 message from an official CWA file.
+    This is used to read model-cycle metadata without downloading the
+    whole 170+ MB forecast file.
+    """
+    validate_fh(fh)
+    did = data_id(fh)
+    cache_buster = int(time.time() // 60)
+
+    sources = [
+        (
+            f"{DIRECT_BASE}/{did}.grb2",
+            {"_rangeprobe": cache_buster},
+            "direct",
+        )
+    ]
+    if CWA_API_KEY:
+        sources.append(
+            (
+                FILEAPI.format(dataid=did),
+                {"Authorization": CWA_API_KEY, "_rangeprobe": cache_buster},
+                "fileapi",
+            )
+        )
+
+    errors = []
+    for url, params, source_name in sources:
+        try:
+            head = _read_limited_response_bytes(url, params, 32)
+            if len(head) < 16 or not head.startswith(b"GRIB"):
+                raise RuntimeError("response does not begin with a GRIB message")
+            edition = head[7]
+            if edition != 2:
+                raise RuntimeError(f"unsupported GRIB edition {edition}")
+
+            total_len = int.from_bytes(head[8:16], "big")
+            max_len = RANGE_PROBE_MAX_FIRST_MESSAGE_MB * 1024 * 1024
+            if total_len < 16 or total_len > max_len:
+                raise RuntimeError(f"unexpected first GRIB message length={total_len}")
+
+            message = _read_limited_response_bytes(url, params, total_len)
+            if len(message) < total_len:
+                raise RuntimeError(
+                    f"incomplete first GRIB message {len(message)}/{total_len} bytes"
+                )
+            if not message.startswith(b"GRIB") or message[-4:] != b"7777":
+                raise RuntimeError("first GRIB message failed integrity markers")
+
+            return message, source_name
+        except Exception as e:
+            errors.append(f"{source_name}: {e}")
+
+    raise RuntimeError("; ".join(errors))
+
+
+def _probe_remote_grib_meta(fh: int):
+    """
+    Return metadata from the first GRIB message of a forecast-hour file.
+    No full-file download and no U/V extraction are performed.
+    """
+    message, source_name = _fetch_first_grib_message(fh)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".grb2",
+            prefix=f"rangeprobe_{fh:03d}_",
+            dir=str(CACHE_DIR),
+            delete=False,
+        ) as tmp:
+            tmp.write(message)
+            tmp_path = Path(tmp.name)
+
+        with open(tmp_path, "rb") as f:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                raise RuntimeError("ecCodes could not decode first GRIB message")
+            try:
+                meta = {
+                    "dataDate": int(safe_get(gid, "dataDate", 0) or 0),
+                    "dataTime": int(safe_get(gid, "dataTime", 0) or 0),
+                    "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
+                }
+            finally:
+                codes_release(gid)
+
+        meta["init_epoch"] = init_epoch(meta)
+        meta["source"] = source_name
+        return meta
+    finally:
+        if tmp_path:
+            tmp_path.unlink(missing_ok=True)
+
+
+def _cached_uv_cycle(fh: int):
+    _, meta_path = uv_cache_paths(fh)
+    meta = _read_uv_meta(meta_path)
+    if not meta:
+        return None
+    try:
+        return int(meta.get("init_epoch"))
+    except Exception:
+        return None
+
+
+def _forecast_hour_matches_cycle(fh: int, expected_init: int, checked: dict):
+    if fh == 0:
+        checked[fh] = {
+            "status": "match",
+            "init_epoch": expected_init,
+            "source": "fh000_probe",
+        }
+        return True
+
+    # Reuse a compact U/V cache if it already proves this file belongs to
+    # the current model cycle.
+    cached_init = _cached_uv_cycle(fh)
+    if cached_init == expected_init:
+        checked[fh] = {
+            "status": "match",
+            "init_epoch": cached_init,
+            "source": "uv_cache",
+        }
+        return True
+
+    try:
+        meta = _probe_remote_grib_meta(fh)
+        got_init = int(meta["init_epoch"])
+        ok = got_init == expected_init
+        checked[fh] = {
+            "status": "match" if ok else "older_cycle",
+            "init_epoch": got_init,
+            "source": meta.get("source", "remote"),
+        }
+        return ok
+    except Exception as e:
+        checked[fh] = {
+            "status": "probe_error",
+            "error": str(e),
+        }
+        return None
+
+
+def get_confirmed_forecast_range(force: bool = False):
+    """
+    Discover how far the newest CWA WRF-3KM cycle is ACTUALLY published.
+
+    We read only the first GRIB message of selected forecast-hour files.
+    Publication is expected to be contiguous in 6-hour steps, so a binary
+    search finds the current boundary with only a few lightweight probes.
+    """
+    now = time.time()
+    if (
+        not force
+        and _range_probe_cache["result"] is not None
+        and now - _range_probe_cache["ts"] < RANGE_PROBE_CACHE_SECONDS
+    ):
+        return _range_probe_cache["result"]
+
+    t0 = time.time()
+    checked = {}
+
+    # FH000 itself is probed remotely so /range does not need to download
+    # the full ~170 MB file merely to identify the newest model cycle.
+    meta0 = _probe_remote_grib_meta(0)
+    latest_init = int(meta0["init_epoch"])
+    checked[0] = {
+        "status": "match",
+        "init_epoch": latest_init,
+        "source": meta0.get("source", "remote"),
+    }
+
+    # If FH000 compact cache is from an older cycle, invalidate it now so
+    # the next actual route calculation refreshes safely.
+    cached0 = _cached_uv_cycle(0)
+    if cached0 is not None and cached0 != latest_init:
+        invalidate_uv_cache(0)
+        diag(
+            f"[RANGE] newer FH000 detected; invalidated stale FH000 U/V cache "
+            f"old={iso_taipei(cached0)} new={iso_taipei(latest_init)}"
+        )
+
+    hours = AVAILABLE_HOURS
+    highest_idx = len(hours) - 1
+    top_status = _forecast_hour_matches_cycle(hours[highest_idx], latest_init, checked)
+
+    if top_status is True:
+        latest_confirmed = hours[highest_idx]
+        complete = True
+    else:
+        # Binary-search publication boundary. Index 0 is known-good.
+        lo = 0
+        hi = highest_idx
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            status = _forecast_hour_matches_cycle(hours[mid], latest_init, checked)
+            if status is True:
+                lo = mid
+            else:
+                # An older cycle OR an unverified probe is treated conservatively
+                # as "not confirmed" for front-end time limits.
+                hi = mid
+
+        latest_confirmed = hours[lo]
+        complete = latest_confirmed >= MAX_FH
+
+    result = {
+        "ok": True,
+        "model": MODEL_NAME,
+        "version": VERSION,
+        "initial_time_utc": iso_utc(latest_init),
+        "initial_time_taipei": iso_taipei(latest_init),
+        "first_valid_time_taipei": iso_taipei(latest_init),
+
+        # Backward-compatible field now means actually confirmed range.
+        "last_valid_time_taipei": iso_taipei(
+            latest_init + latest_confirmed * 3600
+        ),
+
+        "confirmed_last_valid_time_taipei": iso_taipei(
+            latest_init + latest_confirmed * 3600
+        ),
+        "theoretical_last_valid_time_taipei": iso_taipei(
+            latest_init + MAX_FH * 3600
+        ),
+        "latest_confirmed_hour": latest_confirmed,
+        "theoretical_max_forecast_hour": MAX_FH,
+        "publishing_complete": complete,
+        "forecast_hours": AVAILABLE_HOURS,
+        "output_interval_hours": STEP_H,
+        "verification_method": "remote_first_grib_cycle_probe_binary_search",
+        "checked_hours": {
+            str(k): v for k, v in sorted(checked.items())
+        },
+        "probe_elapsed_seconds": round(time.time() - t0, 2),
+        "range_cache_seconds": RANGE_PROBE_CACHE_SECONDS,
+    }
+
+    _range_probe_cache["ts"] = time.time()
+    _range_probe_cache["result"] = result
+
+    diag(
+        f"[RANGE] cycle={iso_taipei(latest_init)} "
+        f"confirmed_fh={latest_confirmed:03d}/{MAX_FH:03d} "
+        f"complete={complete} checked={sorted(checked)} "
+        f"elapsed={time.time()-t0:.1f}s"
+    )
+    return result
+
+
 def read_model_init(lat: float = 23.5, lon: float = 121.0):
     _, meta0 = build_uv10_cache(0)
     return int(meta0["init_epoch"])
@@ -1198,6 +1486,7 @@ def health():
         "grid_index_cache": True,
         "concurrency_safe_uv_cache": True,
         "temporary_gpx_upload": True,
+        "confirmed_range_probe": True,
         "max_gpx_upload_mb": MAX_GPX_UPLOAD_MB,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
         "keep_full_grib": KEEP_FULL_GRIB,
@@ -1207,18 +1496,35 @@ def health():
 
 
 @app.get("/range")
-def forecast_range():
-    init = read_model_init()
-    return {
-        "ok": True,
-        "model": MODEL_NAME,
-        "initial_time_utc": iso_utc(init),
-        "initial_time_taipei": iso_taipei(init),
-        "first_valid_time_taipei": iso_taipei(init),
-        "last_valid_time_taipei": iso_taipei(init + MAX_FH * 3600),
-        "forecast_hours": AVAILABLE_HOURS,
-        "output_interval_hours": STEP_H,
-    }
+def forecast_range(
+    refresh: bool = Query(False, description="Force a fresh publication-range probe.")
+):
+    try:
+        return get_confirmed_forecast_range(force=refresh)
+    except Exception as e:
+        # Conservative fallback: expose the theoretical model horizon but make
+        # it explicit that publication verification failed.
+        init = read_model_init()
+        diag(f"[RANGE] confirmed-range probe failed; fallback to theoretical: {e}")
+        return {
+            "ok": True,
+            "model": MODEL_NAME,
+            "version": VERSION,
+            "initial_time_utc": iso_utc(init),
+            "initial_time_taipei": iso_taipei(init),
+            "first_valid_time_taipei": iso_taipei(init),
+            "last_valid_time_taipei": iso_taipei(init + MAX_FH * 3600),
+            "confirmed_last_valid_time_taipei": None,
+            "theoretical_last_valid_time_taipei": iso_taipei(init + MAX_FH * 3600),
+            "latest_confirmed_hour": None,
+            "theoretical_max_forecast_hour": MAX_FH,
+            "publishing_complete": None,
+            "forecast_hours": AVAILABLE_HOURS,
+            "output_interval_hours": STEP_H,
+            "verification_method": "verification_failed_theoretical_fallback",
+            "verification_error": str(e),
+            "range_cache_seconds": RANGE_PROBE_CACHE_SECONDS,
+        }
 
 
 
@@ -1233,7 +1539,8 @@ def diagnostics():
         "fast_value_array_lookup": True,
         "concurrency_safe_uv_cache": True,
         "temporary_gpx_upload": True,
-        "message": "Logs include U/V cache locks, GRIDMAP hits/misses and ECCODES_FAST timings.",
+        "confirmed_range_probe": True,
+        "message": "Logs include U/V cache locks, GRIDMAP hits/misses, ECCODES_FAST and RANGE timings.",
     }
 
 
