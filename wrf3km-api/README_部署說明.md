@@ -1,50 +1,25 @@
-# WRF3KM Render V0.2.5 — 風況文字分類小修
+# WRF3KM API V0.2.6
 
-這版只修改 `wind_effect()` 的文字分類邏輯，不改：
-- CWA WRF-3KM 資料來源
-- 10 m U/V
-- 4 格點 IDW
-- 時間插值
-- GRIDMAP
-- ECCODES_FAST
-- U/V cache
-- ETA 計算
+## 不變
+- `GET /route-forecast` 仍使用 GitHub 的 `ride-api/routes/current.gpx`
+- `current.gpx` 仍是三套系統共用的正式路線
+- 不修改即時地圖與 Siri 即時語音
 
-因此數值準確度與 V0.2.4 相同。
+## 新增
+- `POST /route-forecast-upload`
+- 可暫時上傳 `.gpx` 做一次預報
+- 上傳 GPX 只在本次 request 記憶體中解析
+- 不寫入 GitHub、不覆蓋 `current.gpx`
+- 預設上限 12 MB
+- CORS 支援 POST
+- requirements 新增 `python-multipart`
 
-## 新分類
+部署後 `/health` 應看到：
+- `"version":"0.2.6"`
+- `"temporary_gpx_upload":true`
 
-使用「風從哪裡吹來」與「騎乘 heading」的相對角度：
+固定路線仍使用：
+`GET /route-forecast`
 
-- 0–30°：逆風
-- 30–84°：側逆風
-- 84–96°：側風
-- 96–150°：側順風
-- 150–180°：順風
-
-其中：
-- 0° = 正面逆風
-- 90° = 純側風
-- 180° = 正後方順風
-
-### 例子
-原本 KM130：
-- heading 295.3°
-- wind FROM 17.5°
-- headwind 1.316 m/s
-- crosswind 9.573 m/s
-
-舊版會標「逆風」。
-V0.2.5 會標成「側逆風」。
-
-JSON 另外新增：
-`relative_wind_angle_deg`
-
-方便之後 UI 判斷與除錯。
-
-## 部署後測試
-
-原本網址直接重跑：
-`/route-forecast?speed_kmh=25&step_km=10&start_km=0&end_km=352`
-
-熱快取速度應與 V0.2.4 幾乎相同。
+臨時路線由 V0.3.1 前端使用：
+`POST /route-forecast-upload`

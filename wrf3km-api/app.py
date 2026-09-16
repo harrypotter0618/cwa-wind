@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from eccodes import (
     codes_get,
@@ -23,7 +23,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -59,6 +59,7 @@ CURRENT_ROUTE_URL = os.getenv(
     "https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx"
 ).strip()
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "300"))
+MAX_GPX_UPLOAD_MB = int(os.getenv("MAX_GPX_UPLOAD_MB", "12"))
 _route_cache = {"ts": 0.0, "route": None, "source": None}
 
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
@@ -83,7 +84,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -1196,6 +1197,8 @@ def health():
         "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
         "grid_index_cache": True,
         "concurrency_safe_uv_cache": True,
+        "temporary_gpx_upload": True,
+        "max_gpx_upload_mb": MAX_GPX_UPLOAD_MB,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
         "keep_full_grib": KEEP_FULL_GRIB,
         "cwa_fileapi_fallback_configured": bool(CWA_API_KEY),
@@ -1229,6 +1232,7 @@ def diagnostics():
         "grid_index_cache": True,
         "fast_value_array_lookup": True,
         "concurrency_safe_uv_cache": True,
+        "temporary_gpx_upload": True,
         "message": "Logs include U/V cache locks, GRIDMAP hits/misses and ECCODES_FAST timings.",
     }
 
@@ -1246,16 +1250,15 @@ def route_info():
     }
 
 
-@app.get("/route-forecast")
-def route_forecast(
-    departure: Optional[str] = Query(
-        None,
-        description="ISO-8601 departure time. No timezone = Taiwan local time. Omit = now."
-    ),
-    speed_kmh: float = Query(25.0, ge=5.0, le=60.0),
-    step_km: float = Query(10.0, ge=2.0, le=50.0),
-    start_km: float = Query(0.0, ge=0.0),
-    end_km: Optional[float] = Query(None, ge=0.0),
+def _calculate_route_forecast(
+    route,
+    route_source: str,
+    route_id: str,
+    departure: Optional[str],
+    speed_kmh: float,
+    step_km: float,
+    start_km: float,
+    end_km: Optional[float],
 ):
     req_t0 = time.time()
     diag(
@@ -1263,8 +1266,6 @@ def route_forecast(
         f"speed_kmh={speed_kmh} step_km={step_km} "
         f"start_km={start_km} end_km={end_km}"
     )
-    rc = load_current_route()
-    route = rc["route"]
     route_distance = route[-1]["cum"]
 
     if start_km > route_distance:
@@ -1532,13 +1533,14 @@ def route_forecast(
             "fast_value_array_lookup": True,
             "concurrency_safe_uv_cache": True,
             "wind_effect_classification": "angle_bands_v1",
+            "temporary_gpx_upload": True,
             "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
             "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
             "full_grib_retained": KEEP_FULL_GRIB,
         },
         "route": {
-            "route_id": "current",
-            "source": rc["source"],
+            "route_id": route_id,
+            "source": route_source,
             "distance_km": round(route_distance, 2),
             "forecast_start_km": round(start_km, 2),
             "forecast_end_km": round(final_km, 2),
@@ -1558,6 +1560,98 @@ def route_forecast(
         "summary": summary,
         "samples": output,
     }
+
+
+
+@app.get("/route-forecast")
+def route_forecast(
+    departure: Optional[str] = Query(
+        None,
+        description="ISO-8601 departure time. No timezone = Taiwan local time. Omit = now."
+    ),
+    speed_kmh: float = Query(25.0, ge=5.0, le=60.0),
+    step_km: float = Query(10.0, ge=2.0, le=50.0),
+    start_km: float = Query(0.0, ge=0.0),
+    end_km: Optional[float] = Query(None, ge=0.0),
+):
+    rc = load_current_route()
+    return _calculate_route_forecast(
+        route=rc["route"],
+        route_source=rc["source"],
+        route_id="current",
+        departure=departure,
+        speed_kmh=speed_kmh,
+        step_km=step_km,
+        start_km=start_km,
+        end_km=end_km,
+    )
+
+
+@app.post("/route-forecast-upload")
+def route_forecast_upload(
+    file: UploadFile = File(..., description="Temporary GPX file. Parsed in memory and not saved."),
+    departure: Optional[str] = Form(None),
+    speed_kmh: float = Form(25.0, ge=5.0, le=60.0),
+    step_km: float = Form(10.0, ge=2.0, le=50.0),
+    start_km: float = Form(0.0, ge=0.0),
+    end_km: Optional[float] = Form(None, ge=0.0),
+):
+    """Forecast a one-off GPX without changing current.gpx."""
+    raw_name = (file.filename or "temporary.gpx").strip()
+    safe_name = Path(raw_name).name
+
+    if not safe_name.lower().endswith(".gpx"):
+        raise HTTPException(
+            400,
+            detail={
+                "code": "INVALID_GPX_FILENAME",
+                "message": "Please upload a .gpx file.",
+            },
+        )
+
+    max_bytes = MAX_GPX_UPLOAD_MB * 1024 * 1024
+    data = file.file.read(max_bytes + 1)
+
+    if len(data) > max_bytes:
+        raise HTTPException(
+            413,
+            detail={
+                "code": "GPX_TOO_LARGE",
+                "message": f"GPX upload exceeds {MAX_GPX_UPLOAD_MB} MB.",
+            },
+        )
+    if len(data) < 32:
+        raise HTTPException(
+            400,
+            detail={"code": "EMPTY_GPX", "message": "GPX file is empty or invalid."},
+        )
+
+    try:
+        route = parse_gpx(data)
+    except Exception as e:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "GPX_PARSE_FAILED",
+                "message": str(e),
+            },
+        )
+
+    diag(
+        f"[ROUTE_UPLOAD] temporary file={safe_name} "
+        f"bytes={len(data)} points={len(route)} distance_km={route[-1]['cum']:.2f}"
+    )
+
+    return _calculate_route_forecast(
+        route=route,
+        route_source=f"upload:{safe_name}",
+        route_id="temporary_upload",
+        departure=departure,
+        speed_kmh=speed_kmh,
+        step_km=step_km,
+        start_km=start_km,
+        end_km=end_km,
+    )
 
 
 def load_uv_for_cycle(fh: int, lat: float, lon: float, expected_init: int):
