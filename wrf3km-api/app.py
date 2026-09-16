@@ -23,7 +23,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -1105,27 +1105,48 @@ def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
 
 
 def wind_effect(wd: float, ws: float, heading: float):
-    raw = ws * math.cos(math.radians(wd - heading))
+    """
+    Classify cycling wind by the angle between:
+      - meteorological wind FROM direction (wd)
+      - rider heading
+
+    0°   = direct headwind
+    90°  = pure crosswind
+    180° = direct tailwind
+
+    V0.2.5 classification bands:
+      0–30°    逆風
+      30–84°   側逆風
+      84–96°   側風
+      96–150°  側順風
+      150–180° 順風
+
+    Numeric head/tail/cross components are unchanged from previous versions.
+    """
+    delta = abs(((wd - heading + 180.0) % 360.0) - 180.0)
+
+    raw = ws * math.cos(math.radians(delta))
     head = max(0.0, raw)
     tail = max(0.0, -raw)
-    cross = abs(ws * math.sin(math.radians(wd - heading)))
+    cross = abs(ws * math.sin(math.radians(delta)))
 
-    if head > max(tail, 0.7):
+    if delta <= 30.0:
         typ = "逆風"
-    elif tail > max(head, 0.7):
-        typ = "順風"
-    elif tail > 0.35:
-        typ = "側順風"
-    elif head > 0.35:
+    elif delta < 84.0:
         typ = "側逆風"
-    else:
+    elif delta <= 96.0:
         typ = "側風"
+    elif delta < 150.0:
+        typ = "側順風"
+    else:
+        typ = "順風"
 
     return {
         "type": typ,
         "head_mps": head,
         "tail_mps": tail,
         "cross_mps": cross,
+        "relative_angle_deg": delta,
     }
 
 
@@ -1457,6 +1478,7 @@ def route_forecast(
             "tailwind_mps": round(effect["tail_mps"], 3),
             "crosswind_mps": round(effect["cross_mps"], 3),
             "wind_effect": effect["type"],
+            "relative_wind_angle_deg": round(effect["relative_angle_deg"], 1),
             "requested_forecast_hour": round(rf, 3),
             "source_hours_used": used,
             "time_interpolation_alpha": None if alpha is None else round(alpha, 4),
@@ -1509,6 +1531,7 @@ def route_forecast(
             "grid_index_cache": True,
             "fast_value_array_lookup": True,
             "concurrency_safe_uv_cache": True,
+            "wind_effect_classification": "angle_bands_v1",
             "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
             "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
             "full_grib_retained": KEEP_FULL_GRIB,
