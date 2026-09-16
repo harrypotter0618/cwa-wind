@@ -24,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -61,6 +61,7 @@ CURRENT_ROUTE_URL = os.getenv(
 ).strip()
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", "300"))
 MAX_GPX_UPLOAD_MB = int(os.getenv("MAX_GPX_UPLOAD_MB", "12"))
+MAX_REST_POINTS = int(os.getenv("MAX_REST_POINTS", "30"))
 RANGE_PROBE_CACHE_SECONDS = int(os.getenv("RANGE_PROBE_CACHE_SECONDS", "300"))
 RANGE_PROBE_MAX_FIRST_MESSAGE_MB = int(os.getenv("RANGE_PROBE_MAX_FIRST_MESSAGE_MB", "64"))
 _range_probe_cache = {"ts": 0.0, "result": None}
@@ -1487,6 +1488,9 @@ def health():
         "concurrency_safe_uv_cache": True,
         "temporary_gpx_upload": True,
         "confirmed_range_probe": True,
+        "route_geometry": True,
+        "rest_point_planning": True,
+        "max_rest_points": MAX_REST_POINTS,
         "max_gpx_upload_mb": MAX_GPX_UPLOAD_MB,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
         "keep_full_grib": KEEP_FULL_GRIB,
@@ -1540,6 +1544,8 @@ def diagnostics():
         "concurrency_safe_uv_cache": True,
         "temporary_gpx_upload": True,
         "confirmed_range_probe": True,
+        "route_geometry": True,
+        "rest_point_planning": True,
         "message": "Logs include U/V cache locks, GRIDMAP hits/misses, ECCODES_FAST and RANGE timings.",
     }
 
@@ -1557,6 +1563,123 @@ def route_info():
     }
 
 
+@app.get("/route-geometry")
+def route_geometry(
+    max_points: int = Query(2500, ge=100, le=5000),
+):
+    rc = load_current_route()
+    route = rc["route"]
+    geometry = simplified_route_geometry(route, max_points=max_points)
+    return {
+        "ok": True,
+        "route_id": "current",
+        "source": rc["source"],
+        "distance_km": round(route[-1]["cum"], 2),
+        "original_points": len(route),
+        "geometry_points": len(geometry),
+        "points": geometry,
+    }
+
+
+
+def parse_rest_points(raw: Optional[str]):
+    """Parse a small JSON list of planned rests supplied by the forecast UI."""
+    if raw is None or str(raw).strip() == "":
+        return []
+
+    try:
+        items = json.loads(raw)
+    except Exception as e:
+        raise HTTPException(
+            400,
+            detail={"code": "REST_POINTS_JSON_INVALID", "message": str(e)},
+        )
+
+    if not isinstance(items, list):
+        raise HTTPException(
+            400,
+            detail={"code": "REST_POINTS_NOT_LIST"},
+        )
+    if len(items) > MAX_REST_POINTS:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "TOO_MANY_REST_POINTS",
+                "max_rest_points": MAX_REST_POINTS,
+            },
+        )
+
+    out = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                400,
+                detail={"code": "REST_POINT_INVALID", "index": i},
+            )
+        try:
+            km = float(item.get("km"))
+            minutes = int(round(float(item.get("minutes"))))
+        except Exception:
+            raise HTTPException(
+                400,
+                detail={"code": "REST_POINT_VALUE_INVALID", "index": i},
+            )
+
+        if not math.isfinite(km) or km < 0:
+            raise HTTPException(
+                400,
+                detail={"code": "REST_POINT_KM_INVALID", "index": i},
+            )
+        if minutes < 1 or minutes > 360:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "REST_POINT_MINUTES_INVALID",
+                    "index": i,
+                    "min": 1,
+                    "max": 360,
+                },
+            )
+
+        name = str(item.get("name") or f"休息點 {i+1}").strip()[:80]
+        row = {"km": km, "minutes": minutes, "name": name}
+
+        # Coordinates are informational only; ETA calculations use route km.
+        for key in ("lat", "lon"):
+            if item.get(key) is not None:
+                try:
+                    v = float(item.get(key))
+                    if math.isfinite(v):
+                        row[key] = v
+                except Exception:
+                    pass
+        out.append(row)
+
+    out.sort(key=lambda x: x["km"])
+    return out
+
+
+def simplified_route_geometry(route, max_points: int = 2500):
+    """
+    Return enough GPX geometry for a browser map without shipping every point.
+    cum km is preserved so forecast samples and rest points can be mapped.
+    """
+    max_points = max(100, min(int(max_points), 5000))
+    n = len(route)
+    if n <= max_points:
+        chosen = route
+    else:
+        stride = max(1, math.ceil((n - 1) / (max_points - 1)))
+        chosen = route[::stride]
+        if chosen[-1] is not route[-1]:
+            chosen = chosen + [route[-1]]
+
+    return [
+        [round(p["lat"], 6), round(p["lon"], 6), round(p["cum"], 3)]
+        for p in chosen
+    ]
+
+
 def _calculate_route_forecast(
     route,
     route_source: str,
@@ -1566,12 +1689,14 @@ def _calculate_route_forecast(
     step_km: float,
     start_km: float,
     end_km: Optional[float],
+    rest_points=None,
 ):
     req_t0 = time.time()
     diag(
         f"[ROUTE_FORECAST] start departure={departure or 'now'} "
         f"speed_kmh={speed_kmh} step_km={step_km} "
-        f"start_km={start_km} end_km={end_km}"
+        f"start_km={start_km} end_km={end_km} "
+        f"rest_points={len(rest_points or [])}"
     )
     route_distance = route[-1]["cum"]
 
@@ -1591,6 +1716,27 @@ def _calculate_route_forecast(
             detail={"code": "END_KM_BEFORE_START_KM"},
         )
 
+    rest_points = list(rest_points or [])
+    for r in rest_points:
+        if r["km"] > route_distance + 1e-6:
+            raise HTTPException(
+                400,
+                detail={
+                    "code": "REST_POINT_OUT_OF_ROUTE",
+                    "rest_km": r["km"],
+                    "route_distance_km": round(route_distance, 2),
+                },
+            )
+
+    # A stop exactly at the starting point is already reflected by the chosen
+    # departure time; a stop at the finish has no effect on riding ETA.
+    active_rests = [
+        r for r in rest_points
+        if start_km < r["km"] < final_km
+    ]
+    active_rests.sort(key=lambda x: x["km"])
+    total_rest_minutes = sum(r["minutes"] for r in active_rests)
+
     departure_epoch = parse_departure(departure)
 
     kms = []
@@ -1608,10 +1754,38 @@ def _calculate_route_forecast(
         f"forecast_segment={start_km:.1f}-{final_km:.1f}km"
     )
 
-    # ETA is based on distance travelled from start_km.
+    # ETA is based on distance travelled plus all completed planned rests.
+    # At the exact rest-point km, ETA means arrival at that stop; the stop
+    # delay is applied to downstream samples.
     for sample in route_samples:
         travelled = sample["km"] - start_km
-        sample["eta_epoch"] = departure_epoch + travelled / speed_kmh * 3600.0
+        prior_rest_minutes = sum(
+            r["minutes"] for r in active_rests
+            if r["km"] < sample["km"] - 1e-6
+        )
+        sample["rest_delay_minutes"] = prior_rest_minutes
+        sample["eta_epoch"] = (
+            departure_epoch
+            + travelled / speed_kmh * 3600.0
+            + prior_rest_minutes * 60.0
+        )
+
+    timed_rests = []
+    prior_minutes = 0
+    for r in active_rests:
+        arrival_epoch = (
+            departure_epoch
+            + (r["km"] - start_km) / speed_kmh * 3600.0
+            + prior_minutes * 60.0
+        )
+        depart_epoch = arrival_epoch + r["minutes"] * 60.0
+        timed_rests.append({
+            **r,
+            "km": round(r["km"], 2),
+            "arrival_taipei": iso_taipei(arrival_epoch),
+            "departure_taipei": iso_taipei(depart_epoch),
+        })
+        prior_minutes += r["minutes"]
 
     coords = [(x["lat"], x["lon"]) for x in route_samples]
 
@@ -1701,6 +1875,7 @@ def _calculate_route_forecast(
             "heading_deg": round(sample["heading"], 1),
             "heading_text": dir_text(sample["heading"]),
             "eta_taipei": iso_taipei(sample["eta_epoch"]),
+            "rest_delay_minutes": sample.get("rest_delay_minutes", 0),
         }
 
         if not spec["available"]:
@@ -1841,6 +2016,8 @@ def _calculate_route_forecast(
             "concurrency_safe_uv_cache": True,
             "wind_effect_classification": "angle_bands_v1",
             "temporary_gpx_upload": True,
+            "rest_point_planning": True,
+            "route_geometry": True,
             "uv_cache_ttl_seconds_fh0_probe": UV_CACHE_TTL,
             "nonzero_uv_cache_policy": "keep_until_model_cycle_changes",
             "full_grib_retained": KEEP_FULL_GRIB,
@@ -1856,8 +2033,19 @@ def _calculate_route_forecast(
             "departure_taipei": iso_taipei(departure_epoch),
             "speed_kmh": speed_kmh,
             "step_km": step_km,
+            "moving_minutes": round(
+                (final_km - start_km) / speed_kmh * 60.0, 1
+            ),
+            "rest_minutes": total_rest_minutes,
+            "total_minutes": round(
+                (final_km - start_km) / speed_kmh * 60.0
+                + total_rest_minutes, 1
+            ),
+            "rest_points": timed_rests,
             "estimated_arrival_taipei": iso_taipei(
-                departure_epoch + (final_km - start_km) / speed_kmh * 3600.0
+                departure_epoch
+                + (final_km - start_km) / speed_kmh * 3600.0
+                + total_rest_minutes * 60.0
             ),
         },
         "model_cycle": {
@@ -1880,8 +2068,13 @@ def route_forecast(
     step_km: float = Query(10.0, ge=2.0, le=50.0),
     start_km: float = Query(0.0, ge=0.0),
     end_km: Optional[float] = Query(None, ge=0.0),
+    rest_points: Optional[str] = Query(
+        None,
+        description="JSON list: [{km, minutes, name, lat?, lon?}]"
+    ),
 ):
     rc = load_current_route()
+    rests = parse_rest_points(rest_points)
     return _calculate_route_forecast(
         route=rc["route"],
         route_source=rc["source"],
@@ -1891,6 +2084,7 @@ def route_forecast(
         step_km=step_km,
         start_km=start_km,
         end_km=end_km,
+        rest_points=rests,
     )
 
 
@@ -1902,6 +2096,7 @@ def route_forecast_upload(
     step_km: float = Form(10.0, ge=2.0, le=50.0),
     start_km: float = Form(0.0, ge=0.0),
     end_km: Optional[float] = Form(None, ge=0.0),
+    rest_points: Optional[str] = Form(None),
 ):
     """Forecast a one-off GPX without changing current.gpx."""
     raw_name = (file.filename or "temporary.gpx").strip()
@@ -1944,9 +2139,12 @@ def route_forecast_upload(
             },
         )
 
+    rests = parse_rest_points(rest_points)
+
     diag(
         f"[ROUTE_UPLOAD] temporary file={safe_name} "
-        f"bytes={len(data)} points={len(route)} distance_km={route[-1]['cum']:.2f}"
+        f"bytes={len(data)} points={len(route)} distance_km={route[-1]['cum']:.2f} "
+        f"rest_points={len(rests)}"
     )
 
     return _calculate_route_forecast(
@@ -1958,6 +2156,7 @@ def route_forecast_upload(
         step_km=step_km,
         start_km=start_km,
         end_km=end_km,
+        rest_points=rests,
     )
 
 
