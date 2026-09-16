@@ -153,10 +153,10 @@
   <header>
     <div>
       <h1>WRF3KM 騎乘風況預報</h1>
-      <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。</div>
+      <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不再鎖死出發時間。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.1</div>
+    <div class="version">UI V0.4.2</div>
   </header>
 
   <section class="panel">
@@ -654,12 +654,16 @@
   function updateDateTimeLimits(){
     if(!forecastRange) return;
     const dateEl=$('departureDate'), timeEl=$('departureTime');
-    const first=forecastRange.first, last=forecastRange.last;
+    const first=forecastRange.first;
+    // CWA 在新一輪模式發布初期可能只有 FH000/FH006。
+    // 不再用「目前已確認發布到哪個 FH」鎖死日期選擇；
+    // 輸入範圍以該模式理論 FH084 為上限，實際發布狀態只做警示。
+    const usableLast=forecastRange.theoretical || forecastRange.last;
     const dist=selectedSegmentDistance();
     const speed=Number($('speed').value);
     const restMinutes=selectedRestMinutes();
     const durationMs=(Number.isFinite(dist)&&speed>0) ? dist/speed*3600000 + restMinutes*60000 : 0;
-    const latestDeparture=new Date(last.getTime()-durationMs);
+    const latestDeparture=new Date(usableLast.getTime()-durationMs);
 
     dateEl.min=fmtTaipeiInputDate(first);
     dateEl.max=fmtTaipeiInputDate(latestDeparture);
@@ -682,61 +686,62 @@
     updateDateTimeLimits();
 
     const first=forecastRange.first;
-    const last=forecastRange.last;
+    const confirmed=forecastRange.confirmed;
+    const theoretical=forecastRange.theoretical || forecastRange.last;
     const dist=selectedSegmentDistance();
     const speed=Number($('speed').value);
 
-    let header;
-    if(forecastRange.confirmed){
+    let header=`最新模式批次：${fmtFullTaipei(first)}`;
+    if(confirmed){
       const fh=forecastRange.latestConfirmedHour;
-      header=`最新模式批次：${fmtFullTaipei(first)}\n`+
-             `本輪已確認發布：FH${String(fh ?? '?').padStart(3,'0')} → ${fmtFullTaipei(forecastRange.confirmed)}`;
-      if(forecastRange.theoretical){
-        header += `\n理論最遠：FH${String(forecastRange.theoreticalMaxHour).padStart(3,'0')} → ${fmtFullTaipei(forecastRange.theoretical)}`;
-      }
-      if(forecastRange.publishingComplete===false){
-        header += '\nCWA 此模式批次仍在發布中；時間選擇已依「實際確認範圍」限制。';
-      }else if(forecastRange.publishingComplete===true){
-        header += '\n本輪已完整發布。';
-      }
-    }else{
-      header=`模式批次：${fmtFullTaipei(first)}\n`;
-      if(forecastRange.theoretical){
-        header += `理論可到：${fmtFullTaipei(forecastRange.theoretical)}\n`;
-      }
-      header += '目前無法驗證最新一輪實際發布到哪個 FH；以下時間限制僅供參考。';
+      header += `\n目前已確認發布：FH${String(fh ?? '?').padStart(3,'0')} → ${fmtFullTaipei(confirmed)}`;
+    }
+    if(theoretical){
+      header += `\n模式理論最遠：FH${String(forecastRange.theoreticalMaxHour).padStart(3,'0')} → ${fmtFullTaipei(theoretical)}`;
+    }
+    if(forecastRange.publishingComplete===false){
+      header += '\nCWA 此模式批次仍在發布中；不再鎖死時間選擇，可先設定並計算。尚未同步的 FH 可能暫時顯示不可用，稍後重算即可。';
+    }else if(forecastRange.publishingComplete===true){
+      header += '\n本輪已完整發布。';
     }
 
     let msg=header;
 
-    if(Number.isFinite(dist)&&speed>0&&last){
+    if(Number.isFinite(dist)&&speed>0&&theoretical){
       const movingH=dist/speed;
       const restMinutes=selectedRestMinutes();
       const totalH=movingH+restMinutes/60;
-      const latestDeparture=new Date(last.getTime()-totalH*3600000);
-      msg += `\n依目前 ${dist.toFixed(1)} km / ${speed.toFixed(1)} km/h：移動約 ${movingH.toFixed(1)} 小時 + 休息 ${restMinutes} 分，總計約 ${totalH.toFixed(1)} 小時；最晚可出發約 ${fmtFullTaipei(latestDeparture)}。`;
+      const latestDeparture=new Date(theoretical.getTime()-totalH*3600000);
+      msg += `\n依目前 ${dist.toFixed(1)} km / ${speed.toFixed(1)} km/h：移動約 ${movingH.toFixed(1)} 小時 + 休息 ${restMinutes} 分，總計約 ${totalH.toFixed(1)} 小時；依 FH084 理論範圍，最晚可出發約 ${fmtFullTaipei(latestDeparture)}。`;
 
       const dep=selectedDepartureDate();
       if(dep){
         const arrival=new Date(dep.getTime()+totalH*3600000);
+
         if(dep<first){
           el.className='forecast-range error';
           el.textContent=msg+`\n目前出發時間早於本輪模式起始時間。`;
           return;
         }
-        if(arrival>last){
+        if(arrival>theoretical){
           el.className='forecast-range error';
-          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，已超過「本輪實際確認可用」時間。`;
+          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，已超過此模式 FH084 的理論預報範圍。`;
           return;
         }
-        const remainingH=(last-arrival)/3600000;
-        el.className=remainingH<6?'forecast-range warn':'forecast-range';
-        el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，仍在已確認可用範圍內。`;
+
+        if(confirmed && arrival>confirmed){
+          el.className='forecast-range warn';
+          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}；此時間尚未全部發布完成，但可以先計算。若部分里程顯示不可用，等 CWA 後續 FH 發布後再按一次「計算預報」。`;
+          return;
+        }
+
+        el.className='forecast-range';
+        el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}，在目前已確認發布範圍內。`;
         return;
       }
     }
 
-    el.className=forecastRange.confirmed?'forecast-range':'forecast-range warn';
+    el.className=forecastRange.publishingComplete===false?'forecast-range warn':'forecast-range';
     el.textContent=msg;
   }
 
@@ -755,7 +760,8 @@
 
       forecastRange={
         first,
-        last: confirmed || theoretical,
+        // UI V0.4.2: confirmed range is informational; selectable horizon uses FH084 theory.
+        last: theoretical || confirmed,
         confirmed,
         theoretical,
         latestConfirmedHour: r.latest_confirmed_hour,
@@ -972,17 +978,20 @@
       const dist=selectedSegmentDistance();
       const durationH=dist/speed + selectedRestMinutes()/60;
       const arrival=new Date(dep.getTime()+durationH*3600000);
-      const latestDeparture=new Date(forecastRange.last.getTime()-durationH*3600000);
+      const hardLast=forecastRange.theoretical || forecastRange.last;
+      const latestDeparture=new Date(hardLast.getTime()-durationH*3600000);
 
       if(dep<forecastRange.first){
         throw new Error(`出發時間太早。目前模式從 ${fmtFullTaipei(forecastRange.first)} 才開始有效。`);
       }
-      if(dep>latestDeparture || arrival>forecastRange.last){
+      if(dep>latestDeparture || arrival>hardLast){
         throw new Error(
-          `超出目前已確認發布的 WRF3KM 時段。依目前路線與速度，最晚出發約 ${fmtFullTaipei(latestDeparture)}；`+
-          `你目前設定預估抵達 ${fmtFullTaipei(arrival)}，但本輪目前只確認到 ${fmtFullTaipei(forecastRange.last)}。`
+          `超出 WRF3KM FH084 理論預報範圍。依目前路線與速度，最晚出發約 ${fmtFullTaipei(latestDeparture)}；`+
+          `你目前設定預估抵達 ${fmtFullTaipei(arrival)}，模式理論最遠到 ${fmtFullTaipei(hardLast)}。`
         );
       }
+      // publishingComplete=false 時不阻擋送出。
+      // 後端會對尚未同步的新 cycle FH 安全標示 degraded / unavailable。
     }
   }
 
@@ -1037,7 +1046,10 @@
       lastData=data;
       renderAll(data);
       const sec=(performance.now()-t0)/1000;
-      setStatus(`完成：${data.summary?.samples_available??0}/${data.summary?.samples_total??0} 個取樣點可用；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
+      const av=data.summary?.samples_available??0,total=data.summary?.samples_total??0;
+      const un=data.summary?.samples_unavailable??0,dg=data.summary?.samples_degraded??0;
+      const rolloutNote=(un>0||dg>0)?`；目前模式發布中：降級 ${dg}、暫不可用 ${un}，稍後可直接重算`:'';
+      setStatus(`完成：${av}/${total} 個取樣點可用${rolloutNote}；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
       $('csvBtn').disabled=false;
     }catch(e){
       const msg=e.name==='AbortError'
