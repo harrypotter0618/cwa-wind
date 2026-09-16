@@ -116,7 +116,7 @@
     .hidden{display:none!important}
     .footer-note{color:var(--muted);font-size:12px;margin:14px 2px 30px}
 
-    .rest-grid{display:grid;grid-template-columns:1.2fr .65fr .65fr 2fr;gap:10px;align-items:end}
+    .rest-grid{display:grid;grid-template-columns:1.2fr .65fr .65fr;gap:10px;align-items:end}
     .map-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
     .map-actions button{width:auto;min-width:130px}
     #forecastMap{height:520px;border-radius:13px;border:1px solid #334155;background:#07101e;overflow:hidden;margin-top:10px}
@@ -156,7 +156,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.0</div>
+    <div class="version">UI V0.4.1</div>
   </header>
 
   <section class="panel">
@@ -270,16 +270,11 @@
         <label for="restKm">里程 km（可直接加入）</label>
         <input id="restKm" type="number" min="0" step="0.1" placeholder="例如 145.8">
       </div>
-      <div>
-        <label for="restAddress">地址／地點（選用）</label>
-        <input id="restAddress" placeholder="例如：625 嘉義縣布袋鎮復興里147-3號">
-      </div>
     </div>
 
     <div class="map-actions">
       <button id="addRestKmBtn" class="secondary">依里程加入</button>
       <button id="mapPickBtn" class="secondary">在地圖點選</button>
-      <button id="addressRestBtn" class="secondary">搜尋地址並加入</button>
       <button id="clearRestsBtn" class="danger">清除休息點</button>
     </div>
 
@@ -287,17 +282,17 @@
     <div id="forecastMap"><div class="map-placeholder">正在載入路線地圖…</div></div>
 
     <div class="legend">
-      <span><i class="dot" style="background:#22c55e"></i>順風</span>
-      <span><i class="dot" style="background:#84cc16"></i>側順風</span>
-      <span><i class="dot" style="background:#94a3b8"></i>側風</span>
-      <span><i class="dot" style="background:#f59e0b"></i>側逆風</span>
-      <span><i class="dot" style="background:#ef4444"></i>逆風</span>
+      <span><i class="dot" style="background:#64748b"></i>近無風／幾乎無感</span>
+      <span><i class="dot" style="background:#84cc16"></i>輕微順風</span>
+      <span><i class="dot" style="background:#22c55e"></i>明顯順風</span>
+      <span><i class="dot" style="background:#f59e0b"></i>輕微逆風</span>
+      <span><i class="dot" style="background:#ef4444"></i>明顯逆風</span>
       <span><i class="dot" style="background:#facc15"></i>休息點</span>
     </div>
 
     <div class="map-hint">
-      預報前先顯示完整 GPX 路線；計算完成後會依 WRF 風況分段上色，不畫風向箭頭。
-      休息點可用「里程」、「地圖點選」或「地址搜尋」加入，位置會吸附到最近路線。
+      預報前先顯示完整 GPX 路線；計算完成後依「沿騎乘方向的實際順逆風分量」分段上色，不畫風向箭頭。
+      休息點可用「里程」或「地圖點選」加入；地圖點選會自動吸附到最近路線。
       休息時間會加入後續 ETA，因此後半段 WRF 預報時間也會跟著延後。
     </div>
     <div id="restList" class="rest-list"></div>
@@ -313,12 +308,13 @@
       <h2>全程風況色帶</h2>
       <div id="strip" class="strip"></div>
       <div class="legend">
-        <span><i class="dot" style="background:#22c55e"></i>順風</span>
-        <span><i class="dot" style="background:#84cc16"></i>側順風</span>
-        <span><i class="dot" style="background:#94a3b8"></i>側風</span>
-        <span><i class="dot" style="background:#f59e0b"></i>側逆風</span>
-        <span><i class="dot" style="background:#ef4444"></i>逆風</span>
+        <span><i class="dot" style="background:#64748b"></i>近無風／幾乎無感</span>
+        <span><i class="dot" style="background:#84cc16"></i>輕微順風</span>
+        <span><i class="dot" style="background:#22c55e"></i>明顯順風</span>
+        <span><i class="dot" style="background:#f59e0b"></i>輕微逆風</span>
+        <span><i class="dot" style="background:#ef4444"></i>明顯逆風</span>
       </div>
+      <div class="note">顏色代表實際沿路方向的順／逆風效益；「側風、側順風、側逆風」仍保留在沿線明細的方向分類中。</div>
     </section>
 
     <section class="panel">
@@ -343,7 +339,7 @@
             <tr>
               <th>里程</th><th>ETA</th><th>累計休息</th><th>模式提前量</th><th>騎乘方向</th>
               <th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
-              <th>側風</th><th>相對角</th><th>風況</th><th>取樣格距</th>
+              <th>側風</th><th>沿線效益</th><th>相對角</th><th>方向分類</th><th>騎乘感受</th><th>取樣格距</th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
@@ -353,7 +349,7 @@
 
     <div class="footer-note">
       「高 / 中高 / 中 / 趨勢」只代表預報提前量的使用提示，不是統計信賴區間。
-      出發前仍建議搭配 CWA 最新預報與實際觀測。地址搜尋使用 OpenStreetMap Nominatim，僅用來把休息地點吸附到路線。
+      出發前仍建議搭配 CWA 最新預報與實際觀測。
     </div>
   </section>
 </div>
@@ -588,36 +584,12 @@
         if(!a.available||!b.available) continue;
         const pts=geometryBetween(a.km,b.km);
         if(pts.length<2) continue;
-        L.polyline(pts,{color:effectColor(a.wind_effect),weight:7,opacity:.95})
-          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(a.wind_effect)} · ${a.wind_speed_mps.toFixed(1)} m/s<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
+        L.polyline(pts,{color:effectColorSample(a),weight:7,opacity:.95})
+          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(effectDisplay(a))}<br>總風速 ${a.wind_speed_mps.toFixed(1)} m/s · 沿線 ${alongEffectValue(a)>=0?'+':''}${alongEffectValue(a).toFixed(2)} m/s<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
           .addTo(windRouteLayer);
       }
     }
     renderRestMarkers();
-  }
-
-  async function searchAddressAndAdd(){
-    const q=$('restAddress').value.trim();
-    if(!q) return setRestStatus('請先輸入地址或地點。',true);
-    if(!routeGeometry.length) return setRestStatus('路線尚未載入。',true);
-    try{
-      $('addressRestBtn').disabled=true;setRestStatus(`搜尋「${q}」…`);
-      const u=new URL('https://nominatim.openstreetmap.org/search');
-      u.searchParams.set('format','jsonv2');u.searchParams.set('limit','1');
-      u.searchParams.set('accept-language','zh-TW');u.searchParams.set('q',q);
-      const r=await fetch(u.toString(),{headers:{'Accept':'application/json'}});
-      if(!r.ok) throw new Error(`HTTP ${r.status}`);
-      const hits=await r.json();
-      if(!hits.length) throw new Error('找不到這個地址／地點');
-      const h=hits[0],lat=Number(h.lat),lon=Number(h.lon),snap=nearestOnRoute(lat,lon);
-      if(!snap) throw new Error('無法吸附到路線');
-      if(snap.distanceKm>10) throw new Error(`搜尋位置距離路線約 ${snap.distanceKm.toFixed(1)} km，未自動加入`);
-      if(!$('restName').value.trim()) $('restName').value=(h.display_name||q).split(',')[0].trim();
-      addRestPoint(snap.km,snap.lat,snap.lon,`地址位置距路線 ${snap.distanceKm.toFixed(2)} km`);
-      $('restAddress').value='';
-      if(map) map.setView([snap.lat,snap.lon],Math.max(map.getZoom(),13));
-    }catch(e){setRestStatus('地址搜尋失敗：'+e.message,true)}
-    finally{$('addressRestBtn').disabled=false}
   }
 
   function taipeiPartsNow(){
@@ -832,7 +804,8 @@
       const h=await fetchJson(`${API_BASE}/health`);
       const uploadOk=Boolean(h.temporary_gpx_upload);
       const restOk=Boolean(h.rest_point_planning);
-      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 臨時 GPX':''}${restOk?' · 休息點 ETA':''}`);
+      const effectV2=Boolean(h.wind_effect_v2);
+      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 臨時 GPX':''}${restOk?' · 休息點 ETA':''}${effectV2?' · 騎乘效益 V2':''}`);
       return h;
     }catch(e){
       setApiState(false,'連線失敗：'+e.message);
@@ -1100,8 +1073,37 @@
   function effectClass(e){
     return e==='順風'?'b-tail':e==='側順風'?'b-tail2':e==='側風'?'b-cross':e==='側逆風'?'b-head2':e==='逆風'?'b-head':'b-near'
   }
-  function effectColor(e){
-    return({'順風':'#22c55e','側順風':'#84cc16','側風':'#94a3b8','側逆風':'#f59e0b','逆風':'#ef4444'})[e]||'#64748b'
+
+  function alongEffectValue(x){
+    if(Number.isFinite(Number(x?.along_effect_mps))) return Number(x.along_effect_mps);
+    return Number(x?.tailwind_mps||0)-Number(x?.headwind_mps||0);
+  }
+
+  function effectStrength(x){
+    if(x?.along_effect_strength) return x.along_effect_strength;
+    const a=Math.abs(alongEffectValue(x));
+    return a<0.3?'幾乎無感':a<1?'輕微':a<2?'明顯':a<3?'強':'很強';
+  }
+
+  function effectDisplay(x){
+    if(x?.near_calm) return `近無風｜${x.wind_effect_detail||x.wind_effect}`;
+    const detail=x?.wind_effect_detail||x?.wind_effect||'—';
+    const v=alongEffectValue(x);
+    if(Math.abs(v)<0.3) return `${detail}｜順逆效益幾乎無感`;
+    return `${detail}｜${effectStrength(x)}${v>0?'順風':'逆風'}`;
+  }
+
+  function effectColorSample(x){
+    const v=alongEffectValue(x);
+    if(x?.near_calm || Math.abs(v)<0.3) return '#64748b';
+    if(v>0){
+      if(v<1) return '#84cc16';
+      if(v<2) return '#22c55e';
+      return '#16a34a';
+    }
+    if(Math.abs(v)<1) return '#f59e0b';
+    if(Math.abs(v)<2) return '#f97316';
+    return '#ef4444';
   }
 
   function renderAll(data){
@@ -1149,8 +1151,9 @@
     $('strip').innerHTML=samples.map((x,i)=>{
       const next=samples[i+1]?.km ?? x.km+1;
       const w=Math.max(.3,((next-x.km)/total)*100);
-      const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜${x.wind_effect}｜${x.wind_speed_mps.toFixed(1)} m/s｜${x.wind_direction_text}`;
-      return `<div class="seg" style="width:${w}%;background:${effectColor(x.wind_effect)}" title="${title}"></div>`
+      const along=alongEffectValue(x);
+      const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜${effectDisplay(x)}｜沿線 ${along>=0?'+':''}${along.toFixed(2)} m/s｜總風速 ${x.wind_speed_mps.toFixed(1)} m/s`;
+      return `<div class="seg" style="width:${w}%;background:${effectColorSample(x)}" title="${title}"></div>`
     }).join('');
   }
 
@@ -1169,8 +1172,10 @@
         <td>${x.tailwind_mps.toFixed(2)}</td>
         <td>${x.headwind_mps.toFixed(2)}</td>
         <td>${x.crosswind_mps.toFixed(2)}</td>
+        <td>${alongEffectValue(x)>=0?'+':''}${alongEffectValue(x).toFixed(2)}</td>
         <td>${Number(x.relative_wind_angle_deg??0).toFixed(1)}°</td>
-        <td><span class="badge ${effectClass(x.wind_effect)}">${x.wind_effect}</span></td>
+        <td><span class="badge ${effectClass(x.wind_effect)}">${x.wind_effect_detail||x.wind_effect}</span></td>
+        <td>${x.near_calm?'近無風 · ':''}${effectStrength(x)}${Math.abs(alongEffectValue(x))>=0.3?(alongEffectValue(x)>0?'順風':'逆風'):'順逆效益'}</td>
         <td>${x.nearest_model_point_distance_km.toFixed(2)} km</td>
       </tr>`
     }).join('');
@@ -1264,7 +1269,6 @@
     $('mapPickBtn').textContent=mapPickArmed?'請點地圖上的位置':'在地圖點選';
     setRestStatus(mapPickArmed?'請在地圖上點選休息位置；系統會吸附到最近路線。':'已取消地圖點選。');
   });
-  $('addressRestBtn').addEventListener('click',searchAddressAndAdd);
   $('clearRestsBtn').addEventListener('click',clearRestPoints);
   $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings();updateForecastWindow()});
   ['departureDate','departureTime','speed','step','startKm','endKm'].forEach(id=>{
