@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>WRF3KM 騎乘風況預報 V0.3.1</title>
+  <style>
+    :root{
+      --bg:#0b1220;--panel:#111827;--panel2:#0f172a;--line:#263244;
+      --text:#e5e7eb;--muted:#94a3b8;--accent:#38bdf8;
+      --tail:#22c55e;--tail2:#84cc16;--cross:#94a3b8;
+      --head2:#f59e0b;--head:#ef4444;--near:#64748b;
+      --shadow:0 12px 30px rgba(0,0,0,.22)
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;background:linear-gradient(180deg,#07101e 0%,var(--bg) 28%,#0a1020 100%);
+      color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",
+      "PingFang TC","Microsoft JhengHei",sans-serif;line-height:1.45
+    }
+    .wrap{max-width:1280px;margin:0 auto;padding:18px}
+    header{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;margin:6px 0 16px}
+    h1{font-size:clamp(22px,3vw,34px);margin:0 0 5px;font-weight:800}
+    .subtitle{color:var(--muted);font-size:14px}
+    .version{
+      font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;
+      color:#bae6fd;background:#082f49;border:1px solid #0c4a6e;padding:6px 9px;
+      border-radius:999px;white-space:nowrap
+    }
+    .panel{
+      background:rgba(17,24,39,.92);border:1px solid var(--line);border-radius:16px;
+      box-shadow:var(--shadow);padding:16px;margin-bottom:14px
+    }
+    .panel h2{font-size:17px;margin:0 0 12px}
+    .grid{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;align-items:end}
+    .grid2{display:grid;grid-template-columns:repeat(2,minmax(160px,1fr));gap:10px}
+    label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}
+    input,select,button{
+      width:100%;border-radius:10px;border:1px solid #334155;background:#0b1220;color:var(--text);
+      padding:10px 11px;font-size:14px;outline:none
+    }
+    input:focus,select:focus{border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+    button{cursor:pointer;font-weight:700}
+    button.primary{background:#0284c7;border-color:#0284c7}
+    button.primary:hover{background:#0369a1}
+    button.secondary{background:#172033}
+    button.danger{background:#451a1a;border-color:#7f1d1d}
+    button:disabled{opacity:.55;cursor:wait}
+    .route-card{
+      display:grid;grid-template-columns:minmax(230px,1fr) minmax(230px,1fr);gap:12px;margin-bottom:14px
+    }
+    .route-option{
+      background:#0f172a;border:1px solid #334155;border-radius:13px;padding:13px;min-height:135px
+    }
+    .route-option.active{border-color:#38bdf8;box-shadow:0 0 0 2px rgba(56,189,248,.1)}
+    .route-title{font-weight:800;margin-bottom:6px}
+    .route-meta{color:var(--muted);font-size:12px;line-height:1.6}
+    .route-meta strong{color:#e2e8f0}
+    .upload-row{display:flex;gap:8px;margin-top:10px;align-items:center}
+    .upload-row input[type=file]{padding:8px;min-width:0}
+    .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+    .actions button{width:auto;min-width:120px}
+    .toggle-row{display:flex;align-items:center;gap:8px;margin-top:10px;color:#cbd5e1;font-size:13px}
+    .toggle-row input{width:auto}
+    .custom-segment{margin-top:10px;padding-top:10px;border-top:1px solid #243144}
+    .note{margin-top:10px;color:var(--muted);font-size:12px}
+    .status{
+      display:none;margin-top:12px;padding:10px 12px;border-radius:10px;background:#0b2239;
+      border:1px solid #164e63;color:#bae6fd;font-size:13px;white-space:pre-wrap
+    }
+    .status.show{display:block}
+    .status.error{display:block;background:#3f1115;border-color:#7f1d1d;color:#fecaca}
+    .api-state{font-size:12px;color:#94a3b8;margin-top:5px}
+    .api-ok{color:#86efac}.api-bad{color:#fca5a5}
+    .summary-grid{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:10px}
+    .card{background:var(--panel2);border:1px solid #233044;border-radius:13px;padding:12px;min-height:90px}
+    .card .k{font-size:12px;color:var(--muted);margin-bottom:5px}
+    .card .v{font-size:19px;font-weight:800}
+    .card .s{font-size:12px;color:var(--muted);margin-top:4px}
+    .lead-high{color:#86efac}.lead-midhigh{color:#bef264}.lead-mid{color:#fde68a}.lead-trend{color:#fdba74}
+    .strip{display:flex;width:100%;height:30px;border-radius:9px;overflow:hidden;border:1px solid #334155;background:#0b1220}
+    .seg{min-width:1px;position:relative}.seg:hover{filter:brightness(1.25)}
+    .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;color:var(--muted);font-size:12px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px}
+    .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .chart-box{background:var(--panel2);border:1px solid #233044;border-radius:13px;padding:10px}
+    .chart-title{font-weight:700;font-size:14px;margin:0 0 7px}
+    canvas{display:block;width:100%;height:300px}
+    .tooltip{
+      position:fixed;pointer-events:none;z-index:99;display:none;background:#020617;border:1px solid #475569;
+      border-radius:9px;padding:8px 10px;font-size:12px;color:#e2e8f0;box-shadow:0 8px 20px rgba(0,0,0,.35);
+      white-space:nowrap
+    }
+    .table-wrap{overflow:auto;border:1px solid #263244;border-radius:12px}
+    table{border-collapse:collapse;width:100%;min-width:1120px;background:#0f172a}
+    th,td{padding:9px;border-bottom:1px solid #1f2937;text-align:right;font-size:12px;white-space:nowrap}
+    th{position:sticky;top:0;background:#172033;color:#cbd5e1;z-index:2}
+    th:first-child,td:first-child{text-align:left}
+    tr:hover td{background:#111d31}
+    .badge{display:inline-block;padding:3px 7px;border-radius:999px;font-weight:700;font-size:11px}
+    .b-tail{background:rgba(34,197,94,.15);color:#86efac}
+    .b-tail2{background:rgba(132,204,22,.15);color:#bef264}
+    .b-cross{background:rgba(148,163,184,.15);color:#cbd5e1}
+    .b-head2{background:rgba(245,158,11,.15);color:#fcd34d}
+    .b-head{background:rgba(239,68,68,.15);color:#fca5a5}
+    .b-near{background:rgba(100,116,139,.18);color:#cbd5e1}
+    .arrow{display:inline-block;font-size:15px;transform-origin:center}
+    .hidden{display:none!important}
+    .footer-note{color:var(--muted);font-size:12px;margin:14px 2px 30px}
+    @media(max-width:1000px){
+      .grid{grid-template-columns:repeat(3,1fr)}
+      .summary-grid{grid-template-columns:repeat(3,1fr)}
+      .charts{grid-template-columns:1fr}
+    }
+    @media(max-width:720px){
+      .wrap{padding:12px}
+      .route-card{grid-template-columns:1fr}
+      .grid{grid-template-columns:1fr 1fr}
+      .summary-grid{grid-template-columns:1fr 1fr}
+      .panel{padding:12px;border-radius:13px}
+      canvas{height:260px}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>WRF3KM 騎乘風況預報</h1>
+      <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。</div>
+      <div id="apiState" class="api-state">API：檢查中…</div>
+    </div>
+    <div class="version">UI V0.3.1</div>
+  </header>
+
+  <section class="panel">
+    <h2>路線</h2>
+    <div class="route-card">
+      <div id="currentCard" class="route-option active">
+        <div class="route-title">正式路線：current.gpx</div>
+        <div class="route-meta">
+          三套系統共用正式路線。<br>
+          距離：<strong id="currentDistance">讀取中…</strong><br>
+          來源：<span id="currentSource">GitHub current.gpx</span>
+        </div>
+        <div class="actions">
+          <button id="useCurrentBtn" class="secondary">使用 current.gpx</button>
+          <button id="refreshRouteBtn" class="secondary">重新讀取路線</button>
+        </div>
+      </div>
+
+      <div id="uploadCard" class="route-option">
+        <div class="route-title">臨時 GPX 試算</div>
+        <div class="route-meta">
+          只做這次預報，不寫入 GitHub，也不改 current.gpx。<br>
+          <span id="uploadMeta">尚未選擇檔案</span>
+        </div>
+        <div class="upload-row">
+          <input id="gpxFile" type="file" accept=".gpx,application/gpx+xml,application/xml,text/xml">
+        </div>
+        <div class="actions">
+          <button id="clearUploadBtn" class="secondary" disabled>清除臨時 GPX</button>
+        </div>
+      </div>
+    </div>
+
+    <h2>騎乘設定</h2>
+    <div class="grid">
+      <div>
+        <label for="departureDate">出發日期（台灣）</label>
+        <input id="departureDate" type="date">
+      </div>
+      <div>
+        <label for="departureTime">出發時間</label>
+        <input id="departureTime" type="time" step="60">
+      </div>
+      <div>
+        <label for="speed">平均移動速度 km/h</label>
+        <input id="speed" type="number" min="5" max="60" step="0.5" value="25">
+      </div>
+      <div>
+        <label for="step">取樣間距</label>
+        <select id="step">
+          <option value="5">5 km</option>
+          <option value="10" selected>10 km</option>
+          <option value="20">20 km</option>
+        </select>
+      </div>
+      <div>
+        <label>目前路線</label>
+        <input id="routeModeLabel" value="current.gpx" disabled>
+      </div>
+      <div>
+        <label>目前路線距離</label>
+        <input id="routeDistanceInput" value="—" disabled>
+      </div>
+    </div>
+
+    <div class="toggle-row">
+      <input id="customSegmentToggle" type="checkbox">
+      <label for="customSegmentToggle" style="margin:0">只預報自訂區段</label>
+    </div>
+
+    <div id="customSegment" class="custom-segment hidden">
+      <div class="grid2">
+        <div>
+          <label for="startKm">起始里程 km</label>
+          <input id="startKm" type="number" min="0" step="1" value="0">
+        </div>
+        <div>
+          <label for="endKm">結束里程 km</label>
+          <input id="endKm" type="number" min="1" step="1" value="352">
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="runBtn" class="primary">計算預報</button>
+      <button id="nowBtn" class="secondary">出發時間設為現在</button>
+      <button id="csvBtn" class="secondary" disabled>下載 CSV</button>
+    </div>
+    <div id="status" class="status"></div>
+    <div class="note">
+      「全程」模式不傳 end_km，後端會自動用目前 GPX 的真實總長，因此換路線不需要手動改 352 km。
+      WRF-3KM 原始網格約 3 km、模式輸出每 6 小時；本頁依 ETA 對 U/V 做時間插值。
+    </div>
+  </section>
+
+  <section id="results" class="hidden">
+    <section class="panel">
+      <h2>摘要</h2>
+      <div id="summary" class="summary-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>全程風況色帶</h2>
+      <div id="strip" class="strip"></div>
+      <div class="legend">
+        <span><i class="dot" style="background:#22c55e"></i>順風</span>
+        <span><i class="dot" style="background:#84cc16"></i>側順風</span>
+        <span><i class="dot" style="background:#94a3b8"></i>側風</span>
+        <span><i class="dot" style="background:#f59e0b"></i>側逆風</span>
+        <span><i class="dot" style="background:#ef4444"></i>逆風</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="charts">
+        <div class="chart-box">
+          <div class="chart-title">順逆風分量（+ 順風 / − 逆風）</div>
+          <canvas id="alongChart"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="chart-title">總風速與側風分量</div>
+          <canvas id="speedChart"></canvas>
+        </div>
+      </div>
+      <div class="note">滑鼠移到圖上可查看該里程數值。</div>
+    </section>
+
+    <section class="panel">
+      <h2>沿線明細</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>里程</th><th>ETA</th><th>模式提前量</th><th>騎乘方向</th>
+              <th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
+              <th>側風</th><th>相對角</th><th>風況</th><th>取樣格距</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="footer-note">
+      「高 / 中高 / 中 / 趨勢」只代表預報提前量的使用提示，不是統計信賴區間。
+      出發前仍建議搭配 CWA 最新預報與實際觀測。
+    </div>
+  </section>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+(() => {
+  const API_BASE = 'https://wrf3km-api.onrender.com';
+  const $ = id => document.getElementById(id);
+
+  let routeMode = 'current';
+  let temporaryFile = null;
+  let temporaryDistanceKm = null;
+  let currentDistanceKm = null;
+  let lastData = null;
+  const state = {alongHit:[], speedHit:[]};
+
+  function taipeiPartsNow(){
+    return new Intl.DateTimeFormat('sv-SE',{
+      timeZone:'Asia/Taipei',year:'numeric',month:'2-digit',day:'2-digit',
+      hour:'2-digit',minute:'2-digit',hour12:false
+    }).formatToParts(new Date()).reduce((a,p)=>(a[p.type]=p.value,a),{});
+  }
+
+  function setNow(){
+    const p=taipeiPartsNow();
+    $('departureDate').value=`${p.year}-${p.month}-${p.day}`;
+    $('departureTime').value=`${p.hour}:${p.minute}`;
+  }
+
+  function departureIso(){
+    const d=$('departureDate').value;
+    const t=$('departureTime').value;
+    if(!d || !t) return '';
+    return `${d}T${t}:00+08:00`;
+  }
+
+  function activeDistance(){
+    return routeMode==='upload' ? temporaryDistanceKm : currentDistanceKm;
+  }
+
+  function setStatus(msg,error=false){
+    const el=$('status');
+    el.textContent=msg;
+    el.className='status show'+(error?' error':'');
+  }
+
+  function setApiState(ok,msg){
+    $('apiState').textContent='API：'+msg;
+    $('apiState').className='api-state '+(ok?'api-ok':'api-bad');
+  }
+
+  async function fetchJson(url, options={}){
+    const r=await fetch(url,{cache:'no-store',...options});
+    const text=await r.text();
+    let data;
+    try{data=JSON.parse(text)}catch{throw new Error(`API 回傳不是 JSON：${text.slice(0,160)}`)}
+    if(!r.ok || data.ok===false){
+      const detail=data?.detail;
+      const msg=typeof detail==='string'?detail:(detail?.message || detail?.code || `HTTP ${r.status}`);
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  async function checkApi(){
+    try{
+      const h=await fetchJson(`${API_BASE}/health`);
+      const uploadOk=Boolean(h.temporary_gpx_upload);
+      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 支援臨時 GPX':' · 尚未支援臨時 GPX'}`);
+      return h;
+    }catch(e){
+      setApiState(false,'連線失敗：'+e.message);
+      return null;
+    }
+  }
+
+  async function refreshCurrentRoute(){
+    $('currentDistance').textContent='讀取中…';
+    try{
+      const d=await fetchJson(`${API_BASE}/route`);
+      currentDistanceKm=Number(d.distance_km);
+      $('currentDistance').textContent=`${currentDistanceKm.toFixed(2)} km`;
+      $('currentSource').textContent=d.source || 'GitHub current.gpx';
+      if(routeMode==='current') updateRouteUI();
+    }catch(e){
+      $('currentDistance').textContent='讀取失敗';
+      setStatus('current.gpx 路線資訊讀取失敗：'+e.message,true);
+    }
+  }
+
+  function haversine(lat1,lon1,lat2,lon2){
+    const R=6371;
+    const toRad=x=>x*Math.PI/180;
+    const dLat=toRad(lat2-lat1),dLon=toRad(lon2-lon1);
+    const a=Math.sin(dLat/2)**2+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+    return 2*R*Math.asin(Math.sqrt(a));
+  }
+
+  async function inspectGpx(file){
+    if(!file) return null;
+    if(!file.name.toLowerCase().endsWith('.gpx')) throw new Error('請選擇 .gpx 檔案');
+    const text=await file.text();
+    const xml=new DOMParser().parseFromString(text,'application/xml');
+    if(xml.querySelector('parsererror')) throw new Error('GPX XML 解析失敗');
+    let nodes=[...xml.getElementsByTagNameNS('*','trkpt')];
+    if(nodes.length<2) nodes=[...xml.getElementsByTagNameNS('*','rtept')];
+    if(nodes.length<2) throw new Error('GPX 至少需要 2 個軌跡點');
+    let total=0,prev=null;
+    for(const n of nodes){
+      const p={lat:Number(n.getAttribute('lat')),lon:Number(n.getAttribute('lon'))};
+      if(!Number.isFinite(p.lat)||!Number.isFinite(p.lon)) continue;
+      if(prev) total+=haversine(prev.lat,prev.lon,p.lat,p.lon);
+      prev=p;
+    }
+    if(!(total>0)) throw new Error('無法計算 GPX 距離');
+    return {distance:total,points:nodes.length};
+  }
+
+  function updateRouteUI(){
+    const isUpload=routeMode==='upload';
+    $('currentCard').classList.toggle('active',!isUpload);
+    $('uploadCard').classList.toggle('active',isUpload);
+    $('routeModeLabel').value=isUpload?(temporaryFile?.name || '臨時 GPX'):'current.gpx';
+    const d=activeDistance();
+    $('routeDistanceInput').value=Number.isFinite(d)?`${d.toFixed(2)} km`:'—';
+    if(Number.isFinite(d)) $('endKm').value=d.toFixed(1);
+  }
+
+  function useCurrent(){
+    routeMode='current';
+    updateRouteUI();
+  }
+
+  async function chooseUpload(file){
+    if(!file) return;
+    try{
+      $('uploadMeta').textContent='分析 GPX…';
+      const info=await inspectGpx(file);
+      temporaryFile=file;
+      temporaryDistanceKm=info.distance;
+      routeMode='upload';
+      $('uploadMeta').innerHTML=`<strong>${escapeHtml(file.name)}</strong><br>約 ${info.distance.toFixed(2)} km · ${info.points} 點`;
+      $('clearUploadBtn').disabled=false;
+      updateRouteUI();
+      setStatus('臨時 GPX 已載入。按「計算預報」時才會上傳給 Render；不會覆蓋 current.gpx。');
+    }catch(e){
+      temporaryFile=null;temporaryDistanceKm=null;
+      $('gpxFile').value='';
+      $('uploadMeta').textContent='尚未選擇檔案';
+      setStatus('GPX 讀取失敗：'+e.message,true);
+    }
+  }
+
+  function clearUpload(){
+    temporaryFile=null;temporaryDistanceKm=null;
+    $('gpxFile').value='';
+    $('uploadMeta').textContent='尚未選擇檔案';
+    $('clearUploadBtn').disabled=true;
+    useCurrent();
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  }
+
+  function saveSettings(){
+    localStorage.setItem('wrf3km-ui-v031',JSON.stringify({
+      departureDate:$('departureDate').value,
+      departureTime:$('departureTime').value,
+      speed:$('speed').value,
+      step:$('step').value,
+      custom:$('customSegmentToggle').checked,
+      startKm:$('startKm').value,
+      endKm:$('endKm').value
+    }));
+  }
+
+  function loadSettings(){
+    let x={};
+    try{x=JSON.parse(localStorage.getItem('wrf3km-ui-v031')||'{}')}catch{}
+    if(x.departureDate && x.departureTime){
+      $('departureDate').value=x.departureDate;
+      $('departureTime').value=x.departureTime;
+    }else setNow();
+    $('speed').value=x.speed||25;
+    $('step').value=x.step||10;
+    $('customSegmentToggle').checked=Boolean(x.custom);
+    $('startKm').value=x.startKm||0;
+    $('endKm').value=x.endKm||352;
+    toggleSegment();
+  }
+
+  function toggleSegment(){
+    $('customSegment').classList.toggle('hidden',!$('customSegmentToggle').checked);
+  }
+
+  function validateSettings(){
+    const speed=Number($('speed').value);
+    const step=Number($('step').value);
+    if(!(speed>=5&&speed<=60)) throw new Error('平均移動速度需在 5–60 km/h');
+    if(!(step>=2&&step<=50)) throw new Error('取樣間距需在 2–50 km');
+    if(!departureIso()) throw new Error('請設定出發日期與時間');
+    if(routeMode==='upload'&&!temporaryFile) throw new Error('尚未選擇臨時 GPX');
+    if(routeMode==='current'&&!Number.isFinite(currentDistanceKm)) throw new Error('current.gpx 路線資訊尚未載入');
+    if($('customSegmentToggle').checked){
+      const a=Number($('startKm').value),b=Number($('endKm').value),d=activeDistance();
+      if(!(a>=0&&b>a)) throw new Error('自訂起訖里程有誤');
+      if(Number.isFinite(d)&&a>d) throw new Error('起始里程超過路線總長');
+    }
+  }
+
+  async function runForecast(){
+    saveSettings();
+    try{validateSettings()}catch(e){setStatus(e.message,true);return}
+
+    $('runBtn').disabled=true;
+    $('csvBtn').disabled=true;
+    const isUpload=routeMode==='upload';
+    setStatus(isUpload
+      ? `正在上傳 ${temporaryFile.name} 並計算 WRF3KM…`
+      : '正在使用 current.gpx 計算 WRF3KM…');
+
+    const speed=Number($('speed').value);
+    const step=Number($('step').value);
+    const custom=$('customSegmentToggle').checked;
+    const startKm=custom?Number($('startKm').value):0;
+    const endKm=custom?Number($('endKm').value):null;
+    const dep=departureIso();
+
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),360000);
+
+    try{
+      const t0=performance.now();
+      let data;
+
+      if(isUpload){
+        const fd=new FormData();
+        fd.append('file',temporaryFile,temporaryFile.name);
+        fd.append('departure',dep);
+        fd.append('speed_kmh',String(speed));
+        fd.append('step_km',String(step));
+        fd.append('start_km',String(startKm));
+        if(endKm!==null) fd.append('end_km',String(endKm));
+        data=await fetchJson(`${API_BASE}/route-forecast-upload`,{
+          method:'POST',body:fd,signal:controller.signal
+        });
+      }else{
+        const u=new URL(`${API_BASE}/route-forecast`);
+        u.searchParams.set('departure',dep);
+        u.searchParams.set('speed_kmh',String(speed));
+        u.searchParams.set('step_km',String(step));
+        u.searchParams.set('start_km',String(startKm));
+        if(endKm!==null) u.searchParams.set('end_km',String(endKm));
+        data=await fetchJson(u.toString(),{signal:controller.signal});
+      }
+
+      lastData=data;
+      renderAll(data);
+      const sec=(performance.now()-t0)/1000;
+      setStatus(`完成：${data.summary?.samples_available??0}/${data.summary?.samples_total??0} 個取樣點可用；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
+      $('csvBtn').disabled=false;
+    }catch(e){
+      const msg=e.name==='AbortError'
+        ?'逾時：等待 API 超過 6 分鐘。請查看 Render Log 是否在冷啟動或下載新模式資料。'
+        :'計算失敗：'+e.message;
+      setStatus(msg,true);
+    }finally{
+      clearTimeout(timer);
+      $('runBtn').disabled=false;
+    }
+  }
+
+  function fmtDateTime(v){
+    if(!v)return'—';
+    return new Intl.DateTimeFormat('zh-TW',{
+      timeZone:'Asia/Taipei',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false
+    }).format(new Date(v));
+  }
+  function fmtTime(v){
+    if(!v)return'—';
+    return new Intl.DateTimeFormat('zh-TW',{
+      timeZone:'Asia/Taipei',hour:'2-digit',minute:'2-digit',hour12:false
+    }).format(new Date(v));
+  }
+  function leadHours(eta,init){return(new Date(eta)-new Date(init))/3600000}
+  function leadBand(h){
+    if(h<=24)return{label:'高',cls:'lead-high'};
+    if(h<=48)return{label:'中高',cls:'lead-midhigh'};
+    if(h<=72)return{label:'中',cls:'lead-mid'};
+    return{label:'趨勢',cls:'lead-trend'}
+  }
+  function fmtLead(h){return Number.isFinite(h)?`${h.toFixed(1)} h`:'—'}
+  function effectClass(e){
+    return e==='順風'?'b-tail':e==='側順風'?'b-tail2':e==='側風'?'b-cross':e==='側逆風'?'b-head2':e==='逆風'?'b-head':'b-near'
+  }
+  function effectColor(e){
+    return({'順風':'#22c55e','側順風':'#84cc16','側風':'#94a3b8','側逆風':'#f59e0b','逆風':'#ef4444'})[e]||'#64748b'
+  }
+
+  function renderAll(data){
+    $('results').classList.remove('hidden');
+    renderSummary(data);
+    renderStrip(data.samples||[]);
+    renderTable(data);
+    requestAnimationFrame(()=>{
+      drawAlongChart(data.samples||[]);
+      drawSpeedChart(data.samples||[]);
+    });
+  }
+
+  function renderSummary(data){
+    const s=data.summary||{},ride=data.ride||{},cycle=data.model_cycle||{},samples=data.samples||[];
+    const depLead=samples.length?leadHours(samples[0].eta_taipei,cycle.initial_time_taipei):NaN;
+    const arrLead=samples.length?leadHours(samples[samples.length-1].eta_taipei,cycle.initial_time_taipei):NaN;
+    const band=leadBand(Math.max(depLead,arrLead));
+    const durationH=(new Date(ride.estimated_arrival_taipei)-new Date(ride.departure_taipei))/3600000;
+    const maxTail=s.max_tailwind?`KM${s.max_tailwind.km} · ${s.max_tailwind.tailwind_mps.toFixed(1)} m/s`:'無';
+    const maxHead=s.max_headwind?`KM${s.max_headwind.km} · ${s.max_headwind.headwind_mps.toFixed(1)} m/s`:'無';
+    const source=data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx';
+    const cards=[
+      ['路線來源',source,`${data.route?.distance_km??'—'} km`],
+      ['預報區段',`${data.route?.forecast_start_km??0}–${data.route?.forecast_end_km??'—'} km`,`取樣 ${s.samples_available??0}/${s.samples_total??0}`],
+      ['出發 / 抵達',fmtDateTime(ride.departure_taipei),`抵達 ${fmtDateTime(ride.estimated_arrival_taipei)} · 約 ${durationH.toFixed(1)} h`],
+      ['模式批次',fmtDateTime(cycle.initial_time_taipei),`有效至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
+      ['預報提前量',`${fmtLead(depLead)} → ${fmtLead(arrLead)}`,`<span class="${band.cls}">使用提示：${band.label}</span>`],
+      ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
+      ['最大逆風',maxHead,s.max_headwind?`${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}`:'—'],
+      ['模式精細度','約 3 km 網格','原始時間輸出 6 h；ETA 間插值'],
+      ['後端',`API ${data.version||'—'}`,data.model||'WRF-3KM']
+    ];
+    $('summary').innerHTML=cards.map(([k,v,sub])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join('');
+  }
+
+  function renderStrip(samples){
+    if(!samples.length){$('strip').innerHTML='';return}
+    const total=Math.max(1,samples[samples.length-1].km-samples[0].km);
+    $('strip').innerHTML=samples.map((x,i)=>{
+      const next=samples[i+1]?.km ?? x.km+1;
+      const w=Math.max(.3,((next-x.km)/total)*100);
+      const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜${x.wind_effect}｜${x.wind_speed_mps.toFixed(1)} m/s｜${x.wind_direction_text}`;
+      return `<div class="seg" style="width:${w}%;background:${effectColor(x.wind_effect)}" title="${title}"></div>`
+    }).join('');
+  }
+
+  function renderTable(data){
+    const init=data.model_cycle?.initial_time_taipei;
+    $('tbody').innerHTML=(data.samples||[]).map(x=>{
+      const lh=leadHours(x.eta_taipei,init),band=leadBand(lh),flowTo=((x.wind_direction_deg+180)%360).toFixed(1);
+      return `<tr>
+        <td><strong>KM${x.km}</strong></td>
+        <td>${fmtTime(x.eta_taipei)}</td>
+        <td><span class="${band.cls}">${fmtLead(lh)} · ${band.label}</span></td>
+        <td>${x.heading_text} ${x.heading_deg.toFixed(1)}°</td>
+        <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${x.wind_direction_deg.toFixed(1)}°</td>
+        <td>${x.wind_speed_mps.toFixed(2)}</td>
+        <td>${x.tailwind_mps.toFixed(2)}</td>
+        <td>${x.headwind_mps.toFixed(2)}</td>
+        <td>${x.crosswind_mps.toFixed(2)}</td>
+        <td>${Number(x.relative_wind_angle_deg??0).toFixed(1)}°</td>
+        <td><span class="badge ${effectClass(x.wind_effect)}">${x.wind_effect}</span></td>
+        <td>${x.nearest_model_point_distance_km.toFixed(2)} km</td>
+      </tr>`
+    }).join('');
+  }
+
+  function prepCanvas(canvas){
+    const dpr=Math.max(1,window.devicePixelRatio||1),r=canvas.getBoundingClientRect();
+    const w=Math.max(320,Math.round(r.width)),h=Math.max(220,Math.round(r.height));
+    canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+    const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);return{ctx,w,h}
+  }
+
+  function axes(ctx,w,h,minX,maxX,minY,maxY){
+    const pad={l:46,r:14,t:12,b:34},x=v=>pad.l+(v-minX)/(maxX-minX||1)*(w-pad.l-pad.r),
+      y=v=>h-pad.b-(v-minY)/(maxY-minY||1)*(h-pad.t-pad.b);
+    ctx.clearRect(0,0,w,h);ctx.font='11px -apple-system,Segoe UI,sans-serif';
+    ctx.strokeStyle='#263244';ctx.fillStyle='#94a3b8';ctx.lineWidth=1;
+    for(let i=0;i<=5;i++){
+      const v=minY+(maxY-minY)*i/5,yy=y(v);ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();ctx.fillText(v.toFixed(1),4,yy+4)
+    }
+    const span=maxX-minX,step=span<=60?10:span<=180?30:50;
+    for(let km=Math.ceil(minX/step)*step;km<=maxX;km+=step){
+      const xx=x(km);ctx.beginPath();ctx.moveTo(xx,pad.t);ctx.lineTo(xx,h-pad.b);ctx.stroke();ctx.fillText(String(km),xx-8,h-12)
+    }
+    ctx.fillText('km',w-28,h-12);return{x,y,pad}
+  }
+
+  function drawAlongChart(samples){
+    const {ctx,w,h}=prepCanvas($('alongChart'));if(!samples.length)return;
+    const vals=samples.map(s=>s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps);
+    const minX=samples[0].km,maxX=samples[samples.length-1].km,maxAbs=Math.max(1,...vals.map(Math.abs));
+    const {x,y,pad}=axes(ctx,w,h,minX,maxX,-Math.ceil(maxAbs),Math.ceil(maxAbs)),y0=y(0);
+    ctx.strokeStyle='#e2e8f0';ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(pad.l,y0);ctx.lineTo(w-pad.r,y0);ctx.stroke();
+    state.alongHit=[];
+    samples.forEach((s,i)=>{
+      const v=vals[i],xx=x(s.km),yy=y(v),next=i<samples.length-1?x(samples[i+1].km):xx+8,prev=i?x(samples[i-1].km):xx-8;
+      const bw=Math.max(2,Math.min(18,(next-prev)*.34));ctx.fillStyle=v>=0?'#22c55e':'#ef4444';
+      ctx.fillRect(xx-bw/2,Math.min(y0,yy),bw,Math.max(1,Math.abs(y0-yy)));state.alongHit.push({x:xx,y:yy,s,v})
+    });
+  }
+
+  function drawSpeedChart(samples){
+    const {ctx,w,h}=prepCanvas($('speedChart'));if(!samples.length)return;
+    const maxV=Math.max(2,...samples.flatMap(s=>[s.wind_speed_mps,s.crosswind_mps]));
+    const {x,y}=axes(ctx,w,h,samples[0].km,samples[samples.length-1].km,0,Math.ceil(maxV));
+    function line(key,color){
+      ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
+      samples.forEach((s,i)=>{const xx=x(s.km),yy=y(s[key]);i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy)});ctx.stroke();
+      samples.forEach(s=>{ctx.fillStyle=color;ctx.beginPath();ctx.arc(x(s.km),y(s[key]),2.2,0,Math.PI*2);ctx.fill()})
+    }
+    line('wind_speed_mps','#38bdf8');line('crosswind_mps','#f59e0b');
+    ctx.font='11px -apple-system,Segoe UI,sans-serif';ctx.fillStyle='#38bdf8';ctx.fillText('總風速',55,23);ctx.fillStyle='#f59e0b';ctx.fillText('側風',110,23);
+    state.speedHit=samples.map(s=>({x:x(s.km),y:y(s.wind_speed_mps),s}))
+  }
+
+  function nearestHit(canvas,list,e){
+    if(!list?.length)return null;const r=canvas.getBoundingClientRect(),mx=e.clientX-r.left;
+    let best=null,bd=Infinity;list.forEach(h=>{const d=Math.abs(mx-h.x);if(d<bd){bd=d;best=h}});return bd<28?best:null
+  }
+
+  function bindTooltip(canvasId,key){
+    const c=$(canvasId),tip=$('tooltip');
+    c.addEventListener('mousemove',e=>{
+      const h=nearestHit(c,state[key],e);if(!h){tip.style.display='none';return}
+      const s=h.s,signed=s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps;
+      tip.innerHTML=`<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>${s.wind_effect}｜風 ${s.wind_speed_mps.toFixed(1)} m/s｜側風 ${s.crosswind_mps.toFixed(1)} m/s<br>順逆分量 ${signed>=0?'+':''}${signed.toFixed(1)} m/s`;
+      tip.style.left=Math.min(window.innerWidth-220,e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';tip.style.display='block'
+    });
+    c.addEventListener('mouseleave',()=>tip.style.display='none')
+  }
+
+  function downloadCSV(){
+    if(!lastData)return;
+    const rows=[['km','eta_taipei','heading_deg','wind_direction_deg','wind_speed_mps','tailwind_mps','headwind_mps','crosswind_mps','relative_wind_angle_deg','wind_effect','requested_forecast_hour','nearest_model_point_distance_km']];
+    (lastData.samples||[]).forEach(s=>rows.push([s.km,s.eta_taipei,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,s.tailwind_mps,s.headwind_mps,s.crosswind_mps,s.relative_wind_angle_deg,s.wind_effect,s.requested_forecast_hour,s.nearest_model_point_distance_km]));
+    const csv='\ufeff'+rows.map(r=>r.map(v=>{const t=String(v??'');return /[",\n]/.test(t)?`"${t.replaceAll('"','""')}"`:t}).join(',')).join('\n');
+    const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download=`wrf3km_forecast_${Date.now()}.csv`;a.click();URL.revokeObjectURL(a.href)
+  }
+
+  $('runBtn').addEventListener('click',runForecast);
+  $('nowBtn').addEventListener('click',()=>{setNow();saveSettings()});
+  $('csvBtn').addEventListener('click',downloadCSV);
+  $('useCurrentBtn').addEventListener('click',useCurrent);
+  $('refreshRouteBtn').addEventListener('click',refreshCurrentRoute);
+  $('clearUploadBtn').addEventListener('click',clearUpload);
+  $('gpxFile').addEventListener('change',e=>chooseUpload(e.target.files?.[0]));
+  $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings()});
+  ['departureDate','departureTime','speed','step','startKm','endKm'].forEach(id=>$(id).addEventListener('change',saveSettings));
+
+  bindTooltip('alongChart','alongHit');
+  bindTooltip('speedChart','speedHit');
+
+  window.addEventListener('resize',()=>{
+    if(lastData){
+      clearTimeout(window.__resizeTimer);
+      window.__resizeTimer=setTimeout(()=>{drawAlongChart(lastData.samples||[]);drawSpeedChart(lastData.samples||[])},120)
+    }
+  });
+
+  loadSettings();
+  checkApi();
+  refreshCurrentRoute();
+  updateRouteUI();
+})();
+</script>
+</body>
+</html>
