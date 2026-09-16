@@ -153,10 +153,10 @@
   <header>
     <div>
       <h1>WRF3KM 騎乘風況預報</h1>
-      <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不再鎖死出發時間。</div>
+      <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.2</div>
+    <div class="version">UI V0.4.3</div>
   </header>
 
   <section class="panel">
@@ -700,7 +700,7 @@
       header += `\n模式理論最遠：FH${String(forecastRange.theoreticalMaxHour).padStart(3,'0')} → ${fmtFullTaipei(theoretical)}`;
     }
     if(forecastRange.publishingComplete===false){
-      header += '\nCWA 此模式批次仍在發布中；不再鎖死時間選擇，可先設定並計算。尚未同步的 FH 可能暫時顯示不可用，稍後重算即可。';
+      header += '\nCWA 此模式批次仍在發布中；不鎖死時間選擇。計算時後端會優先採用最新 cycle；若不足，會自動退回上一個能完整涵蓋整趟的單一 cycle。';
     }else if(forecastRange.publishingComplete===true){
       header += '\n本輪已完整發布。';
     }
@@ -731,7 +731,7 @@
 
         if(confirmed && arrival>confirmed){
           el.className='forecast-range warn';
-          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}；此時間尚未全部發布完成，但可以先計算。若部分里程顯示不可用，等 CWA 後續 FH 發布後再按一次「計算預報」。`;
+          el.textContent=msg+`\n目前設定預估抵達 ${fmtFullTaipei(arrival)}；最新 cycle 尚未全部發布完成。可以先計算，後端會嘗試使用上一個可完整涵蓋的單一 cycle。`;
           return;
         }
 
@@ -799,7 +799,10 @@
     try{data=JSON.parse(text)}catch{throw new Error(`API 回傳不是 JSON：${text.slice(0,160)}`)}
     if(!r.ok || data.ok===false){
       const detail=data?.detail;
-      const msg=typeof detail==='string'?detail:(detail?.message || detail?.code || `HTTP ${r.status}`);
+      let msg=typeof detail==='string'?detail:(detail?.message || detail?.code || `HTTP ${r.status}`);
+      if(detail?.code==='NO_COHERENT_PUBLISHED_CYCLE'){
+        msg='CWA 正在切換模式批次，目前找不到一個「單一 cycle」可以完整涵蓋這趟騎乘。系統沒有混用不同批次；請稍後再算，或改近一點的出發時間。';
+      }
       throw new Error(msg);
     }
     return data;
@@ -811,7 +814,8 @@
       const uploadOk=Boolean(h.temporary_gpx_upload);
       const restOk=Boolean(h.rest_point_planning);
       const effectV2=Boolean(h.wind_effect_v2);
-      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 臨時 GPX':''}${restOk?' · 休息點 ETA':''}${effectV2?' · 騎乘效益 V2':''}`);
+      const cycleFallback=Boolean(h.coherent_cycle_fallback);
+      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 臨時 GPX':''}${restOk?' · 休息點 ETA':''}${effectV2?' · 騎乘效益 V2':''}${cycleFallback?' · cycle 自動退回':''}`);
       return h;
     }catch(e){
       setApiState(false,'連線失敗：'+e.message);
@@ -1048,8 +1052,10 @@
       const sec=(performance.now()-t0)/1000;
       const av=data.summary?.samples_available??0,total=data.summary?.samples_total??0;
       const un=data.summary?.samples_unavailable??0,dg=data.summary?.samples_degraded??0;
-      const rolloutNote=(un>0||dg>0)?`；目前模式發布中：降級 ${dg}、暫不可用 ${un}，稍後可直接重算`:'';
-      setStatus(`完成：${av}/${total} 個取樣點可用${rolloutNote}；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
+      const fallbackH=Number(data.model_cycle?.fallback_from_latest_hours||0);
+      const cycleNote=fallbackH>0?`；已自動退回上一輪 ${fallbackH} 小時的完整 cycle`:'';
+      const rolloutNote=(un>0||dg>0)?`；降級 ${dg}、暫不可用 ${un}`:'';
+      setStatus(`完成：${av}/${total} 個取樣點可用${cycleNote}${rolloutNote}；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
       $('csvBtn').disabled=false;
     }catch(e){
       const msg=e.name==='AbortError'
@@ -1147,7 +1153,10 @@
       ['預報區段',`${data.route?.forecast_start_km??0}–${data.route?.forecast_end_km??'—'} km`,`取樣 ${s.samples_available??0}/${s.samples_total??0}`],
       ['出發 / 抵達',fmtDateTime(ride.departure_taipei),`抵達 ${fmtDateTime(ride.estimated_arrival_taipei)} · 約 ${durationH.toFixed(1)} h`],
       ['休息規劃',`${restMin} 分`,`移動 ${(movingMin/60).toFixed(1)} h + 休息 ${(restMin/60).toFixed(1)} h`],
-      ['模式批次',fmtDateTime(cycle.initial_time_taipei),`本次計算模型範圍至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
+      ['模式批次',fmtDateTime(cycle.initial_time_taipei),
+        cycle.using_fallback_cycle
+          ? `最新 ${fmtDateTime(cycle.latest_initial_time_taipei)} 尚在發布中；本次自動退回 ${cycle.fallback_from_latest_hours||0} h · 可用至 ${fmtDateTime(cycle.last_valid_time_taipei)}`
+          : `本次使用最新 cycle · 模型範圍至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
       ['預報提前量',`${fmtLead(depLead)} → ${fmtLead(arrLead)}`,`<span class="${band.cls}">使用提示：${band.label}</span>`],
       ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
       ['最大逆風',maxHead,s.max_headwind?`${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}`:'—'],
@@ -1163,8 +1172,14 @@
     $('strip').innerHTML=samples.map((x,i)=>{
       const next=samples[i+1]?.km ?? x.km+1;
       const w=Math.max(.3,((next-x.km)/total)*100);
+
+      if(!x.available){
+        const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜暫無可用模式資料｜${x.reason||'UNAVAILABLE'}`;
+        return `<div class="seg" style="width:${w}%;background:#334155" title="${title}"></div>`
+      }
+
       const along=alongEffectValue(x);
-      const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜${effectDisplay(x)}｜沿線 ${along>=0?'+':''}${along.toFixed(2)} m/s｜總風速 ${x.wind_speed_mps.toFixed(1)} m/s`;
+      const title=`KM${x.km} ${fmtTime(x.eta_taipei)}｜${effectDisplay(x)}｜沿線 ${along>=0?'+':''}${along.toFixed(2)} m/s｜總風速 ${Number(x.wind_speed_mps).toFixed(1)} m/s`;
       return `<div class="seg" style="width:${w}%;background:${effectColorSample(x)}" title="${title}"></div>`
     }).join('');
   }
@@ -1172,23 +1187,33 @@
   function renderTable(data){
     const init=data.model_cycle?.initial_time_taipei;
     $('tbody').innerHTML=(data.samples||[]).map(x=>{
-      const lh=leadHours(x.eta_taipei,init),band=leadBand(lh),flowTo=((x.wind_direction_deg+180)%360).toFixed(1);
-      return `<tr>
-        <td><strong>KM${x.km}</strong></td>
+      const lh=leadHours(x.eta_taipei,init),band=leadBand(lh);
+      const baseStart=`<td><strong>KM${x.km}</strong></td>
         <td>${fmtTime(x.eta_taipei)}</td>
         <td>${Number(x.rest_delay_minutes||0)} 分</td>
         <td><span class="${band.cls}">${fmtLead(lh)} · ${band.label}</span></td>
-        <td>${x.heading_text} ${x.heading_deg.toFixed(1)}°</td>
-        <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${x.wind_direction_deg.toFixed(1)}°</td>
-        <td>${x.wind_speed_mps.toFixed(2)}</td>
-        <td>${x.tailwind_mps.toFixed(2)}</td>
-        <td>${x.headwind_mps.toFixed(2)}</td>
-        <td>${x.crosswind_mps.toFixed(2)}</td>
-        <td>${alongEffectValue(x)>=0?'+':''}${alongEffectValue(x).toFixed(2)}</td>
+        <td>${x.heading_text||'—'} ${Number.isFinite(Number(x.heading_deg))?Number(x.heading_deg).toFixed(1)+'°':'—'}</td>`;
+
+      if(!x.available){
+        return `<tr>${baseStart}
+          <td colspan="10"><span class="badge b-near">暫無可用模式資料</span> ${escapeHtml(x.reason||'UNAVAILABLE')}</td>
+        </tr>`;
+      }
+
+      const flowTo=((Number(x.wind_direction_deg)+180)%360).toFixed(1);
+      const along=alongEffectValue(x);
+      return `<tr>
+        ${baseStart}
+        <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${Number(x.wind_direction_deg).toFixed(1)}°</td>
+        <td>${Number(x.wind_speed_mps).toFixed(2)}</td>
+        <td>${Number(x.tailwind_mps).toFixed(2)}</td>
+        <td>${Number(x.headwind_mps).toFixed(2)}</td>
+        <td>${Number(x.crosswind_mps).toFixed(2)}</td>
+        <td>${along>=0?'+':''}${along.toFixed(2)}</td>
         <td>${Number(x.relative_wind_angle_deg??0).toFixed(1)}°</td>
         <td><span class="badge ${effectClass(x.wind_effect)}">${x.wind_effect_detail||x.wind_effect}</span></td>
-        <td>${x.near_calm?'近無風 · ':''}${effectStrength(x)}${Math.abs(alongEffectValue(x))>=0.3?(alongEffectValue(x)>0?'順風':'逆風'):'順逆效益'}</td>
-        <td>${x.nearest_model_point_distance_km.toFixed(2)} km</td>
+        <td>${x.near_calm?'近無風 · ':''}${effectStrength(x)}${Math.abs(along)>=0.3?(along>0?'順風':'逆風'):'順逆效益'}</td>
+        <td>${Number(x.nearest_model_point_distance_km).toFixed(2)} km</td>
       </tr>`
     }).join('');
   }
@@ -1216,31 +1241,46 @@
   }
 
   function drawAlongChart(samples){
-    const {ctx,w,h}=prepCanvas($('alongChart'));if(!samples.length)return;
-    const vals=samples.map(s=>s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps);
-    const minX=samples[0].km,maxX=samples[samples.length-1].km,maxAbs=Math.max(1,...vals.map(Math.abs));
+    const {ctx,w,h}=prepCanvas($('alongChart'));
+    const valid=(samples||[]).filter(s=>s.available && Number.isFinite(Number(s.tailwind_mps)) && Number.isFinite(Number(s.headwind_mps)));
+    state.alongHit=[];
+    if(!valid.length){
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle='#94a3b8';ctx.font='12px -apple-system,Segoe UI,sans-serif';
+      ctx.fillText('目前沒有可繪製的風況資料',20,30);
+      return;
+    }
+    const vals=valid.map(s=>Number(s.tailwind_mps)>0?Number(s.tailwind_mps):-Number(s.headwind_mps));
+    const minX=valid[0].km,maxX=valid[valid.length-1].km,maxAbs=Math.max(1,...vals.map(Math.abs));
     const {x,y,pad}=axes(ctx,w,h,minX,maxX,-Math.ceil(maxAbs),Math.ceil(maxAbs)),y0=y(0);
     ctx.strokeStyle='#e2e8f0';ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(pad.l,y0);ctx.lineTo(w-pad.r,y0);ctx.stroke();
-    state.alongHit=[];
-    samples.forEach((s,i)=>{
-      const v=vals[i],xx=x(s.km),yy=y(v),next=i<samples.length-1?x(samples[i+1].km):xx+8,prev=i?x(samples[i-1].km):xx-8;
+    valid.forEach((s,i)=>{
+      const v=vals[i],xx=x(s.km),yy=y(v),next=i<valid.length-1?x(valid[i+1].km):xx+8,prev=i?x(valid[i-1].km):xx-8;
       const bw=Math.max(2,Math.min(18,(next-prev)*.34));ctx.fillStyle=v>=0?'#22c55e':'#ef4444';
       ctx.fillRect(xx-bw/2,Math.min(y0,yy),bw,Math.max(1,Math.abs(y0-yy)));state.alongHit.push({x:xx,y:yy,s,v})
     });
   }
 
   function drawSpeedChart(samples){
-    const {ctx,w,h}=prepCanvas($('speedChart'));if(!samples.length)return;
-    const maxV=Math.max(2,...samples.flatMap(s=>[s.wind_speed_mps,s.crosswind_mps]));
-    const {x,y}=axes(ctx,w,h,samples[0].km,samples[samples.length-1].km,0,Math.ceil(maxV));
+    const {ctx,w,h}=prepCanvas($('speedChart'));
+    const valid=(samples||[]).filter(s=>s.available && Number.isFinite(Number(s.wind_speed_mps)) && Number.isFinite(Number(s.crosswind_mps)));
+    state.speedHit=[];
+    if(!valid.length){
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle='#94a3b8';ctx.font='12px -apple-system,Segoe UI,sans-serif';
+      ctx.fillText('目前沒有可繪製的風況資料',20,30);
+      return;
+    }
+    const maxV=Math.max(2,...valid.flatMap(s=>[Number(s.wind_speed_mps),Number(s.crosswind_mps)]));
+    const {x,y}=axes(ctx,w,h,valid[0].km,valid[valid.length-1].km,0,Math.ceil(maxV));
     function line(key,color){
       ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
-      samples.forEach((s,i)=>{const xx=x(s.km),yy=y(s[key]);i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy)});ctx.stroke();
-      samples.forEach(s=>{ctx.fillStyle=color;ctx.beginPath();ctx.arc(x(s.km),y(s[key]),2.2,0,Math.PI*2);ctx.fill()})
+      valid.forEach((s,i)=>{const xx=x(s.km),yy=y(Number(s[key]));i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy)});ctx.stroke();
+      valid.forEach(s=>{ctx.fillStyle=color;ctx.beginPath();ctx.arc(x(s.km),y(Number(s[key])),2.2,0,Math.PI*2);ctx.fill()})
     }
     line('wind_speed_mps','#38bdf8');line('crosswind_mps','#f59e0b');
     ctx.font='11px -apple-system,Segoe UI,sans-serif';ctx.fillStyle='#38bdf8';ctx.fillText('總風速',55,23);ctx.fillStyle='#f59e0b';ctx.fillText('側風',110,23);
-    state.speedHit=samples.map(s=>({x:x(s.km),y:y(s.wind_speed_mps),s}))
+    state.speedHit=valid.map(s=>({x:x(s.km),y:y(Number(s.wind_speed_mps)),s}))
   }
 
   function nearestHit(canvas,list,e){
@@ -1252,8 +1292,8 @@
     const c=$(canvasId),tip=$('tooltip');
     c.addEventListener('mousemove',e=>{
       const h=nearestHit(c,state[key],e);if(!h){tip.style.display='none';return}
-      const s=h.s,signed=s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps;
-      tip.innerHTML=`<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>${s.wind_effect}｜風 ${s.wind_speed_mps.toFixed(1)} m/s｜側風 ${s.crosswind_mps.toFixed(1)} m/s<br>順逆分量 ${signed>=0?'+':''}${signed.toFixed(1)} m/s`;
+      const s=h.s,signed=Number(s.tailwind_mps)>0?Number(s.tailwind_mps):-Number(s.headwind_mps);
+      tip.innerHTML=`<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>${s.wind_effect_detail||s.wind_effect}｜風 ${Number(s.wind_speed_mps).toFixed(1)} m/s｜側風 ${Number(s.crosswind_mps).toFixed(1)} m/s<br>順逆分量 ${signed>=0?'+':''}${signed.toFixed(1)} m/s`;
       tip.style.left=Math.min(window.innerWidth-220,e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';tip.style.display='block'
     });
     c.addEventListener('mouseleave',()=>tip.style.display='none')
@@ -1261,8 +1301,22 @@
 
   function downloadCSV(){
     if(!lastData)return;
-    const rows=[['km','eta_taipei','rest_delay_minutes','heading_deg','wind_direction_deg','wind_speed_mps','tailwind_mps','headwind_mps','crosswind_mps','relative_wind_angle_deg','wind_effect','requested_forecast_hour','nearest_model_point_distance_km']];
-    (lastData.samples||[]).forEach(s=>rows.push([s.km,s.eta_taipei,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,s.tailwind_mps,s.headwind_mps,s.crosswind_mps,s.relative_wind_angle_deg,s.wind_effect,s.requested_forecast_hour,s.nearest_model_point_distance_km]));
+    const rows=[[
+      'km','eta_taipei','rest_delay_minutes','available','reason',
+      'heading_deg','wind_direction_deg','wind_speed_mps',
+      'tailwind_mps','headwind_mps','crosswind_mps',
+      'along_effect_mps','relative_wind_angle_deg',
+      'wind_effect','wind_effect_detail','along_effect_strength','near_calm',
+      'requested_forecast_hour','nearest_model_point_distance_km'
+    ]];
+    (lastData.samples||[]).forEach(s=>rows.push([
+      s.km,s.eta_taipei,s.rest_delay_minutes,s.available,s.reason,
+      s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
+      s.tailwind_mps,s.headwind_mps,s.crosswind_mps,
+      s.along_effect_mps,s.relative_wind_angle_deg,
+      s.wind_effect,s.wind_effect_detail,s.along_effect_strength,s.near_calm,
+      s.requested_forecast_hour,s.nearest_model_point_distance_km
+    ]));
     const csv='\ufeff'+rows.map(r=>r.map(v=>{const t=String(v??'');return /[",\n]/.test(t)?`"${t.replaceAll('"','""')}"`:t}).join(',')).join('\n');
     const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download=`wrf3km_forecast_${Date.now()}.csv`;a.click();URL.revokeObjectURL(a.href)
   }
