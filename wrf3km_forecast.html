@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f172a">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <title>WRF3KM 騎乘風況預報</title>
   <style>
     :root{
@@ -114,10 +115,26 @@
     .arrow{display:inline-block;font-size:15px;transform-origin:center}
     .hidden{display:none!important}
     .footer-note{color:var(--muted);font-size:12px;margin:14px 2px 30px}
+
+    .rest-grid{display:grid;grid-template-columns:1.2fr .65fr .65fr 2fr;gap:10px;align-items:end}
+    .map-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+    .map-actions button{width:auto;min-width:130px}
+    #forecastMap{height:520px;border-radius:13px;border:1px solid #334155;background:#07101e;overflow:hidden;margin-top:10px}
+    .map-hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.55}
+    .rest-status{margin-top:8px;padding:8px 10px;border-radius:9px;background:#0b2239;border:1px solid #164e63;color:#bae6fd;font-size:12px;display:none;white-space:pre-wrap}
+    .rest-status.show{display:block}
+    .rest-status.error{display:block;background:#3f1115;border-color:#7f1d1d;color:#fecaca}
+    .rest-list{display:grid;gap:7px;margin-top:10px}
+    .rest-item{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;background:#0f172a;border:1px solid #263244;border-radius:10px;padding:9px 10px}
+    .rest-main{font-size:13px}
+    .rest-sub{font-size:11px;color:var(--muted);margin-top:2px}
+    .rest-item button{width:auto;padding:6px 9px;font-size:12px}
+
     @media(max-width:1000px){
       .grid{grid-template-columns:repeat(3,1fr)}
       .summary-grid{grid-template-columns:repeat(3,1fr)}
       .charts{grid-template-columns:1fr}
+      .rest-grid{grid-template-columns:1fr 1fr}
     }
     @media(max-width:720px){
       .wrap{padding:12px}
@@ -126,6 +143,8 @@
       .summary-grid{grid-template-columns:1fr 1fr}
       .panel{padding:12px;border-radius:13px}
       canvas{height:260px}
+      .rest-grid{grid-template-columns:1fr}
+      #forecastMap{height:420px}
     }
   </style>
 </head>
@@ -137,7 +156,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.3.3</div>
+    <div class="version">UI V0.4.0</div>
   </header>
 
   <section class="panel">
@@ -235,6 +254,55 @@
     </div>
   </section>
 
+
+  <section class="panel">
+    <h2>路線風況地圖＋休息點規劃</h2>
+    <div class="rest-grid">
+      <div>
+        <label for="restName">休息點名稱（選填）</label>
+        <input id="restName" placeholder="例如：布袋補給">
+      </div>
+      <div>
+        <label for="restMinutes">休息時間（分鐘）</label>
+        <input id="restMinutes" type="number" min="1" max="360" step="1" value="10">
+      </div>
+      <div>
+        <label for="restKm">里程 km（可直接加入）</label>
+        <input id="restKm" type="number" min="0" step="0.1" placeholder="例如 145.8">
+      </div>
+      <div>
+        <label for="restAddress">地址／地點（選用）</label>
+        <input id="restAddress" placeholder="例如：625 嘉義縣布袋鎮復興里147-3號">
+      </div>
+    </div>
+
+    <div class="map-actions">
+      <button id="addRestKmBtn" class="secondary">依里程加入</button>
+      <button id="mapPickBtn" class="secondary">在地圖點選</button>
+      <button id="addressRestBtn" class="secondary">搜尋地址並加入</button>
+      <button id="clearRestsBtn" class="danger">清除休息點</button>
+    </div>
+
+    <div id="restStatus" class="rest-status"></div>
+    <div id="forecastMap"><div class="map-placeholder">正在載入路線地圖…</div></div>
+
+    <div class="legend">
+      <span><i class="dot" style="background:#22c55e"></i>順風</span>
+      <span><i class="dot" style="background:#84cc16"></i>側順風</span>
+      <span><i class="dot" style="background:#94a3b8"></i>側風</span>
+      <span><i class="dot" style="background:#f59e0b"></i>側逆風</span>
+      <span><i class="dot" style="background:#ef4444"></i>逆風</span>
+      <span><i class="dot" style="background:#facc15"></i>休息點</span>
+    </div>
+
+    <div class="map-hint">
+      預報前先顯示完整 GPX 路線；計算完成後會依 WRF 風況分段上色，不畫風向箭頭。
+      休息點可用「里程」、「地圖點選」或「地址搜尋」加入，位置會吸附到最近路線。
+      休息時間會加入後續 ETA，因此後半段 WRF 預報時間也會跟著延後。
+    </div>
+    <div id="restList" class="rest-list"></div>
+  </section>
+
   <section id="results" class="hidden">
     <section class="panel">
       <h2>摘要</h2>
@@ -273,7 +341,7 @@
         <table>
           <thead>
             <tr>
-              <th>里程</th><th>ETA</th><th>模式提前量</th><th>騎乘方向</th>
+              <th>里程</th><th>ETA</th><th>累計休息</th><th>模式提前量</th><th>騎乘方向</th>
               <th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
               <th>側風</th><th>相對角</th><th>風況</th><th>取樣格距</th>
             </tr>
@@ -285,13 +353,14 @@
 
     <div class="footer-note">
       「高 / 中高 / 中 / 趨勢」只代表預報提前量的使用提示，不是統計信賴區間。
-      出發前仍建議搭配 CWA 最新預報與實際觀測。
+      出發前仍建議搭配 CWA 最新預報與實際觀測。地址搜尋使用 OpenStreetMap Nominatim，僅用來把休息地點吸附到路線。
     </div>
   </section>
 </div>
 
 <div id="tooltip" class="tooltip"></div>
 
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 (() => {
   const API_BASE = 'https://wrf3km-api.onrender.com';
@@ -300,10 +369,256 @@
   let routeMode = 'current';
   let temporaryFile = null;
   let temporaryDistanceKm = null;
+  let temporaryGeometry = [];
   let currentDistanceKm = null;
+  let currentGeometry = [];
+  let routeGeometry = [];
   let lastData = null;
   let forecastRange = null;
+  let restPoints = [];
+  let mapPickArmed = false;
+  let map = null;
+  let baseRouteLayer = null;
+  let windRouteLayer = null;
+  let restMarkerLayer = null;
   const state = {alongHit:[], speedHit:[]};
+
+
+  function setRestStatus(msg,error=false){
+    const el=$('restStatus');
+    if(!msg){el.textContent='';el.className='rest-status';return}
+    el.textContent=msg;
+    el.className='rest-status show'+(error?' error':'');
+  }
+
+  function initMap(){
+    if(!window.L){
+      $('forecastMap').innerHTML='<div class="map-placeholder">Leaflet 載入失敗；其他預報功能仍可使用。</div>';
+      return;
+    }
+    $('forecastMap').innerHTML='';
+    map=L.map('forecastMap',{preferCanvas:true}).setView([23.7,120.9],7);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19,attribution:'&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    baseRouteLayer=L.layerGroup().addTo(map);
+    windRouteLayer=L.layerGroup().addTo(map);
+    restMarkerLayer=L.layerGroup().addTo(map);
+    map.on('click',e=>{
+      if(!mapPickArmed) return;
+      mapPickArmed=false;
+      $('mapPickBtn').textContent='在地圖點選';
+      if(!routeGeometry.length){setRestStatus('目前沒有可用路線幾何。',true);return}
+      const snap=nearestOnRoute(e.latlng.lat,e.latlng.lng);
+      if(!snap){setRestStatus('無法吸附到路線。',true);return}
+      addRestPoint(snap.km,snap.lat,snap.lon,`地圖點選，距路線 ${snap.distanceKm.toFixed(2)} km`);
+    });
+  }
+
+  function setRouteGeometry(points,fit=true){
+    routeGeometry=(points||[])
+      .map(p=>Array.isArray(p)?{lat:Number(p[0]),lon:Number(p[1]),km:Number(p[2])}:p)
+      .filter(p=>Number.isFinite(p.lat)&&Number.isFinite(p.lon)&&Number.isFinite(p.km))
+      .sort((a,b)=>a.km-b.km);
+    drawRouteMap();
+    if(map && fit && routeGeometry.length>1){
+      map.fitBounds(L.latLngBounds(routeGeometry.map(p=>[p.lat,p.lon])),{padding:[18,18]});
+    }
+  }
+
+  function resetPlanningForRoute(message='路線已切換，已清除原休息點。'){
+    restPoints=[];
+    lastData=null;
+    $('results').classList.add('hidden');
+    $('csvBtn').disabled=true;
+    renderRestList();
+    drawRouteMap();
+    updateForecastWindow();
+    if(message) setRestStatus(message);
+  }
+
+  function pointAtRouteKm(km){
+    if(!routeGeometry.length) return null;
+    km=Math.max(routeGeometry[0].km,Math.min(km,routeGeometry[routeGeometry.length-1].km));
+    let lo=0,hi=routeGeometry.length-1;
+    while(lo<hi){
+      const mid=Math.floor((lo+hi)/2);
+      if(routeGeometry[mid].km<km) lo=mid+1; else hi=mid;
+    }
+    const b=routeGeometry[lo];
+    if(lo===0) return {...b};
+    const a=routeGeometry[lo-1],span=b.km-a.km;
+    const t=span<=1e-9?0:(km-a.km)/span;
+    return {km,lat:a.lat+t*(b.lat-a.lat),lon:a.lon+t*(b.lon-a.lon)};
+  }
+
+  function nearestOnRoute(lat,lon){
+    if(routeGeometry.length<2) return null;
+    let best=null;
+    for(let i=0;i<routeGeometry.length-1;i++){
+      const a=routeGeometry[i],b=routeGeometry[i+1];
+      const meanLat=(lat+a.lat+b.lat)/3*Math.PI/180;
+      const sx=111.32*Math.cos(meanLat),sy=110.574;
+      const ax=(a.lon-lon)*sx,ay=(a.lat-lat)*sy;
+      const bx=(b.lon-lon)*sx,by=(b.lat-lat)*sy;
+      const dx=bx-ax,dy=by-ay,den=dx*dx+dy*dy;
+      let t=den>0?-(ax*dx+ay*dy)/den:0;
+      t=Math.max(0,Math.min(1,t));
+      const px=ax+t*dx,py=ay+t*dy,d=Math.hypot(px,py);
+      if(!best||d<best.distanceKm){
+        best={distanceKm:d,km:a.km+t*(b.km-a.km),lat:a.lat+t*(b.lat-a.lat),lon:a.lon+t*(b.lon-a.lon)};
+      }
+    }
+    return best;
+  }
+
+  function geometryBetween(km0,km1){
+    if(!routeGeometry.length) return [];
+    const pts=[],a=pointAtRouteKm(km0),b=pointAtRouteKm(km1);
+    if(a) pts.push([a.lat,a.lon]);
+    for(const p of routeGeometry) if(p.km>km0&&p.km<km1) pts.push([p.lat,p.lon]);
+    if(b) pts.push([b.lat,b.lon]);
+    return pts;
+  }
+
+  function currentSegmentBounds(){
+    const d=activeDistance();
+    if(!Number.isFinite(d)) return {start:0,end:Infinity};
+    if(!$('customSegmentToggle').checked) return {start:0,end:d};
+    return {start:Number($('startKm').value)||0,end:Math.min(Number($('endKm').value)||d,d)};
+  }
+
+  function selectedRestPoints(){
+    const {start,end}=currentSegmentBounds();
+    return restPoints.filter(r=>r.km>start&&r.km<end);
+  }
+
+  function selectedRestMinutes(){
+    return selectedRestPoints().reduce((sum,r)=>sum+Number(r.minutes||0),0);
+  }
+
+  function restPayload(){
+    return restPoints.map(r=>({
+      km:Number(r.km.toFixed(3)),minutes:Number(r.minutes),name:r.name,
+      lat:Number(r.lat.toFixed(6)),lon:Number(r.lon.toFixed(6))
+    }));
+  }
+
+  function invalidateForecast(message='休息點已變更，請重新計算預報。'){
+    if(lastData){
+      lastData=null;
+      $('results').classList.add('hidden');
+      $('csvBtn').disabled=true;
+      drawRouteMap();
+    }
+    setRestStatus(message);
+    updateForecastWindow();
+  }
+
+  function addRestPoint(km,lat=null,lon=null,sourceNote=''){
+    km=Number(km);
+    const minutes=Math.round(Number($('restMinutes').value));
+    if(!Number.isFinite(km)) return setRestStatus('休息點里程無效。',true);
+    if(!(minutes>=1&&minutes<=360)) return setRestStatus('休息時間需為 1–360 分鐘。',true);
+    const d=activeDistance();
+    if(Number.isFinite(d)&&(km<=0||km>=d)) return setRestStatus(`休息點需位於 0–${d.toFixed(1)} km 之間。`,true);
+    const p=(Number.isFinite(lat)&&Number.isFinite(lon))?{lat,lon}:pointAtRouteKm(km);
+    if(!p) return setRestStatus('目前尚未載入路線幾何，無法加入休息點。',true);
+
+    const customName=$('restName').value.trim();
+    const name=customName||`休息點 ${restPoints.length+1}`;
+    restPoints.push({id:Date.now()+Math.random(),km,minutes,name,lat:p.lat,lon:p.lon});
+    restPoints.sort((a,b)=>a.km-b.km);
+    $('restKm').value='';
+    $('restName').value='';
+    renderRestList();
+    drawRouteMap();
+    invalidateForecast(`${name} 已加入：KM ${km.toFixed(1)}，休息 ${minutes} 分${sourceNote?`（${sourceNote}）`:''}。`);
+  }
+
+  function removeRestPoint(id){
+    restPoints=restPoints.filter(r=>String(r.id)!==String(id));
+    renderRestList();drawRouteMap();invalidateForecast('已移除休息點，請重新計算預報。');
+  }
+
+  function clearRestPoints(){
+    if(!restPoints.length){setRestStatus('目前沒有休息點。');return}
+    restPoints=[];renderRestList();drawRouteMap();invalidateForecast('已清除全部休息點。');
+  }
+
+  function timedRestFor(r){
+    return (lastData?.ride?.rest_points||[]).find(x=>Math.abs(Number(x.km)-r.km)<0.06);
+  }
+
+  function renderRestList(){
+    const el=$('restList');
+    if(!restPoints.length){
+      el.innerHTML='<div class="note">尚未規劃休息點。</div>';renderRestMarkers();return;
+    }
+    const bounds=currentSegmentBounds();
+    el.innerHTML=restPoints.map(r=>{
+      const t=timedRestFor(r),inside=r.km>bounds.start&&r.km<bounds.end;
+      const timing=t?` · 抵達 ${fmtTime(t.arrival_taipei)} → ${fmtTime(t.departure_taipei)}`:'';
+      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · ${r.minutes} 分</div><div class="rest-sub">${inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
+    }).join('');
+    el.querySelectorAll('[data-rest-remove]').forEach(btn=>btn.addEventListener('click',()=>removeRestPoint(btn.dataset.restRemove)));
+    renderRestMarkers();
+  }
+
+  function renderRestMarkers(){
+    if(!map||!restMarkerLayer) return;
+    restMarkerLayer.clearLayers();
+    for(const r of restPoints){
+      const t=timedRestFor(r),timing=t?`<br>抵達 ${fmtTime(t.arrival_taipei)}<br>離開 ${fmtTime(t.departure_taipei)}`:'';
+      L.circleMarker([r.lat,r.lon],{radius:7,color:'#713f12',weight:2,fillColor:'#facc15',fillOpacity:1})
+        .bindPopup(`<strong>${escapeHtml(r.name)}</strong><br>KM ${r.km.toFixed(1)}<br>休息 ${r.minutes} 分${timing}`)
+        .addTo(restMarkerLayer);
+    }
+  }
+
+  function drawRouteMap(){
+    if(!map||!baseRouteLayer||!windRouteLayer) return;
+    baseRouteLayer.clearLayers();windRouteLayer.clearLayers();
+    if(routeGeometry.length<2){renderRestMarkers();return}
+    L.polyline(routeGeometry.map(p=>[p.lat,p.lon]),{color:'#64748b',weight:5,opacity:.75}).addTo(baseRouteLayer);
+    if(lastData?.samples?.length){
+      const samples=lastData.samples;
+      for(let i=0;i<samples.length-1;i++){
+        const a=samples[i],b=samples[i+1];
+        if(!a.available||!b.available) continue;
+        const pts=geometryBetween(a.km,b.km);
+        if(pts.length<2) continue;
+        L.polyline(pts,{color:effectColor(a.wind_effect),weight:7,opacity:.95})
+          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(a.wind_effect)} · ${a.wind_speed_mps.toFixed(1)} m/s<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
+          .addTo(windRouteLayer);
+      }
+    }
+    renderRestMarkers();
+  }
+
+  async function searchAddressAndAdd(){
+    const q=$('restAddress').value.trim();
+    if(!q) return setRestStatus('請先輸入地址或地點。',true);
+    if(!routeGeometry.length) return setRestStatus('路線尚未載入。',true);
+    try{
+      $('addressRestBtn').disabled=true;setRestStatus(`搜尋「${q}」…`);
+      const u=new URL('https://nominatim.openstreetmap.org/search');
+      u.searchParams.set('format','jsonv2');u.searchParams.set('limit','1');
+      u.searchParams.set('accept-language','zh-TW');u.searchParams.set('q',q);
+      const r=await fetch(u.toString(),{headers:{'Accept':'application/json'}});
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      const hits=await r.json();
+      if(!hits.length) throw new Error('找不到這個地址／地點');
+      const h=hits[0],lat=Number(h.lat),lon=Number(h.lon),snap=nearestOnRoute(lat,lon);
+      if(!snap) throw new Error('無法吸附到路線');
+      if(snap.distanceKm>10) throw new Error(`搜尋位置距離路線約 ${snap.distanceKm.toFixed(1)} km，未自動加入`);
+      if(!$('restName').value.trim()) $('restName').value=(h.display_name||q).split(',')[0].trim();
+      addRestPoint(snap.km,snap.lat,snap.lon,`地址位置距路線 ${snap.distanceKm.toFixed(2)} km`);
+      $('restAddress').value='';
+      if(map) map.setView([snap.lat,snap.lon],Math.max(map.getZoom(),13));
+    }catch(e){setRestStatus('地址搜尋失敗：'+e.message,true)}
+    finally{$('addressRestBtn').disabled=false}
+  }
 
   function taipeiPartsNow(){
     return new Intl.DateTimeFormat('sv-SE',{
@@ -370,7 +685,8 @@
     const first=forecastRange.first, last=forecastRange.last;
     const dist=selectedSegmentDistance();
     const speed=Number($('speed').value);
-    const durationMs=(Number.isFinite(dist)&&speed>0) ? dist/speed*3600000 : 0;
+    const restMinutes=selectedRestMinutes();
+    const durationMs=(Number.isFinite(dist)&&speed>0) ? dist/speed*3600000 + restMinutes*60000 : 0;
     const latestDeparture=new Date(last.getTime()-durationMs);
 
     dateEl.min=fmtTaipeiInputDate(first);
@@ -422,13 +738,15 @@
     let msg=header;
 
     if(Number.isFinite(dist)&&speed>0&&last){
-      const durationH=dist/speed;
-      const latestDeparture=new Date(last.getTime()-durationH*3600000);
-      msg += `\n依目前 ${dist.toFixed(1)} km / ${speed.toFixed(1)} km/h，預估騎乘 ${durationH.toFixed(1)} 小時；最晚可出發約 ${fmtFullTaipei(latestDeparture)}。`;
+      const movingH=dist/speed;
+      const restMinutes=selectedRestMinutes();
+      const totalH=movingH+restMinutes/60;
+      const latestDeparture=new Date(last.getTime()-totalH*3600000);
+      msg += `\n依目前 ${dist.toFixed(1)} km / ${speed.toFixed(1)} km/h：移動約 ${movingH.toFixed(1)} 小時 + 休息 ${restMinutes} 分，總計約 ${totalH.toFixed(1)} 小時；最晚可出發約 ${fmtFullTaipei(latestDeparture)}。`;
 
       const dep=selectedDepartureDate();
       if(dep){
-        const arrival=new Date(dep.getTime()+durationH*3600000);
+        const arrival=new Date(dep.getTime()+totalH*3600000);
         if(dep<first){
           el.className='forecast-range error';
           el.textContent=msg+`\n目前出發時間早於本輪模式起始時間。`;
@@ -513,7 +831,8 @@
     try{
       const h=await fetchJson(`${API_BASE}/health`);
       const uploadOk=Boolean(h.temporary_gpx_upload);
-      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 支援臨時 GPX':' · 尚未支援臨時 GPX'}`);
+      const restOk=Boolean(h.rest_point_planning);
+      setApiState(true,`已連線 · API ${h.version}${uploadOk?' · 臨時 GPX':''}${restOk?' · 休息點 ETA':''}`);
       return h;
     }catch(e){
       setApiState(false,'連線失敗：'+e.message);
@@ -525,14 +844,16 @@
     $('currentDistance').textContent='讀取中…';
     try{
       const d=await fetchJson(`${API_BASE}/route`);
+      const g=await fetchJson(`${API_BASE}/route-geometry?max_points=2500`);
       currentDistanceKm=Number(d.distance_km);
+      currentGeometry=(g.points||[]).map(p=>({lat:Number(p[0]),lon:Number(p[1]),km:Number(p[2])}));
       $('currentDistance').textContent=`${currentDistanceKm.toFixed(2)} km`;
       $('currentSource').textContent=d.source || 'GitHub current.gpx';
-      if(routeMode==='current') updateRouteUI();
+      if(routeMode==='current'){setRouteGeometry(currentGeometry,true);updateRouteUI()}
       updateForecastWindow();
     }catch(e){
       $('currentDistance').textContent='讀取失敗';
-      setStatus('current.gpx 路線資訊讀取失敗：'+e.message,true);
+      setStatus('current.gpx 路線資訊／地圖讀取失敗：'+e.message,true);
     }
   }
 
@@ -547,21 +868,27 @@
   async function inspectGpx(file){
     if(!file) return null;
     if(!file.name.toLowerCase().endsWith('.gpx')) throw new Error('請選擇 .gpx 檔案');
-    const text=await file.text();
-    const xml=new DOMParser().parseFromString(text,'application/xml');
+    const text=await file.text(),xml=new DOMParser().parseFromString(text,'application/xml');
     if(xml.querySelector('parsererror')) throw new Error('GPX XML 解析失敗');
     let nodes=[...xml.getElementsByTagNameNS('*','trkpt')];
     if(nodes.length<2) nodes=[...xml.getElementsByTagNameNS('*','rtept')];
     if(nodes.length<2) throw new Error('GPX 至少需要 2 個軌跡點');
-    let total=0,prev=null;
+    let total=0,prev=null,raw=[];
     for(const n of nodes){
       const p={lat:Number(n.getAttribute('lat')),lon:Number(n.getAttribute('lon'))};
       if(!Number.isFinite(p.lat)||!Number.isFinite(p.lon)) continue;
       if(prev) total+=haversine(prev.lat,prev.lon,p.lat,p.lon);
-      prev=p;
+      raw.push({lat:p.lat,lon:p.lon,km:total});prev=p;
     }
-    if(!(total>0)) throw new Error('無法計算 GPX 距離');
-    return {distance:total,points:nodes.length};
+    if(!(total>0)||raw.length<2) throw new Error('無法計算 GPX 距離');
+    const maxPts=2500;
+    let geometry=raw;
+    if(raw.length>maxPts){
+      const stride=Math.max(1,Math.ceil((raw.length-1)/(maxPts-1)));
+      geometry=raw.filter((_,i)=>i%stride===0);
+      if(geometry[geometry.length-1]!==raw[raw.length-1]) geometry.push(raw[raw.length-1]);
+    }
+    return {distance:total,points:raw.length,geometry};
   }
 
   function updateRouteUI(){
@@ -576,8 +903,11 @@
   }
 
   function useCurrent(){
+    const changed=routeMode!=='current';
     routeMode='current';
+    setRouteGeometry(currentGeometry,changed);
     updateRouteUI();
+    if(changed) resetPlanningForRoute();
   }
 
   async function chooseUpload(file){
@@ -587,14 +917,17 @@
       const info=await inspectGpx(file);
       temporaryFile=file;
       temporaryDistanceKm=info.distance;
+      temporaryGeometry=info.geometry;
       routeMode='upload';
       $('uploadMeta').innerHTML=`<strong>${escapeHtml(file.name)}</strong><br>約 ${info.distance.toFixed(2)} km · ${info.points} 點`;
       $('clearUploadBtn').disabled=false;
+      setRouteGeometry(temporaryGeometry,true);
       updateRouteUI();
+      resetPlanningForRoute('已切換到臨時 GPX，已清除原休息點。');
       updateForecastWindow();
       setStatus('臨時 GPX 已載入。按「計算預報」時才會上傳給 Render；不會覆蓋 current.gpx。');
     }catch(e){
-      temporaryFile=null;temporaryDistanceKm=null;
+      temporaryFile=null;temporaryDistanceKm=null;temporaryGeometry=[];
       $('gpxFile').value='';
       $('uploadMeta').textContent='尚未選擇檔案';
       setStatus('GPX 讀取失敗：'+e.message,true);
@@ -602,7 +935,7 @@
   }
 
   function clearUpload(){
-    temporaryFile=null;temporaryDistanceKm=null;
+    temporaryFile=null;temporaryDistanceKm=null;temporaryGeometry=[];
     $('gpxFile').value='';
     $('uploadMeta').textContent='尚未選擇檔案';
     $('clearUploadBtn').disabled=true;
@@ -644,6 +977,7 @@
   function toggleSegment(){
     $('customSegment').classList.toggle('hidden',!$('customSegmentToggle').checked);
     updateForecastWindow();
+    renderRestList();
   }
 
   function validateSettings(){
@@ -663,7 +997,7 @@
     if(forecastRange){
       const dep=selectedDepartureDate();
       const dist=selectedSegmentDistance();
-      const durationH=dist/speed;
+      const durationH=dist/speed + selectedRestMinutes()/60;
       const arrival=new Date(dep.getTime()+durationH*3600000);
       const latestDeparture=new Date(forecastRange.last.getTime()-durationH*3600000);
 
@@ -712,6 +1046,7 @@
         fd.append('step_km',String(step));
         fd.append('start_km',String(startKm));
         if(endKm!==null) fd.append('end_km',String(endKm));
+        if(restPoints.length) fd.append('rest_points',JSON.stringify(restPayload()));
         data=await fetchJson(`${API_BASE}/route-forecast-upload`,{
           method:'POST',body:fd,signal:controller.signal
         });
@@ -722,6 +1057,7 @@
         u.searchParams.set('step_km',String(step));
         u.searchParams.set('start_km',String(startKm));
         if(endKm!==null) u.searchParams.set('end_km',String(endKm));
+        if(restPoints.length) u.searchParams.set('rest_points',JSON.stringify(restPayload()));
         data=await fetchJson(u.toString(),{signal:controller.signal});
       }
 
@@ -773,6 +1109,8 @@
     renderSummary(data);
     renderStrip(data.samples||[]);
     renderTable(data);
+    drawRouteMap();
+    renderRestList();
     requestAnimationFrame(()=>{
       drawAlongChart(data.samples||[]);
       drawSpeedChart(data.samples||[]);
@@ -788,10 +1126,13 @@
     const maxTail=s.max_tailwind?`KM${s.max_tailwind.km} · ${s.max_tailwind.tailwind_mps.toFixed(1)} m/s`:'無';
     const maxHead=s.max_headwind?`KM${s.max_headwind.km} · ${s.max_headwind.headwind_mps.toFixed(1)} m/s`:'無';
     const source=data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx';
+    const movingMin=Number(ride.moving_minutes ?? durationH*60);
+    const restMin=Number(ride.rest_minutes ?? 0);
     const cards=[
       ['路線來源',source,`${data.route?.distance_km??'—'} km`],
       ['預報區段',`${data.route?.forecast_start_km??0}–${data.route?.forecast_end_km??'—'} km`,`取樣 ${s.samples_available??0}/${s.samples_total??0}`],
       ['出發 / 抵達',fmtDateTime(ride.departure_taipei),`抵達 ${fmtDateTime(ride.estimated_arrival_taipei)} · 約 ${durationH.toFixed(1)} h`],
+      ['休息規劃',`${restMin} 分`,`移動 ${(movingMin/60).toFixed(1)} h + 休息 ${(restMin/60).toFixed(1)} h`],
       ['模式批次',fmtDateTime(cycle.initial_time_taipei),`本次計算模型範圍至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
       ['預報提前量',`${fmtLead(depLead)} → ${fmtLead(arrLead)}`,`<span class="${band.cls}">使用提示：${band.label}</span>`],
       ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
@@ -820,6 +1161,7 @@
       return `<tr>
         <td><strong>KM${x.km}</strong></td>
         <td>${fmtTime(x.eta_taipei)}</td>
+        <td>${Number(x.rest_delay_minutes||0)} 分</td>
         <td><span class="${band.cls}">${fmtLead(lh)} · ${band.label}</span></td>
         <td>${x.heading_text} ${x.heading_deg.toFixed(1)}°</td>
         <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${x.wind_direction_deg.toFixed(1)}°</td>
@@ -902,7 +1244,7 @@
 
   function downloadCSV(){
     if(!lastData)return;
-    const rows=[['km','eta_taipei','heading_deg','wind_direction_deg','wind_speed_mps','tailwind_mps','headwind_mps','crosswind_mps','relative_wind_angle_deg','wind_effect','requested_forecast_hour','nearest_model_point_distance_km']];
+    const rows=[['km','eta_taipei','rest_delay_minutes','heading_deg','wind_direction_deg','wind_speed_mps','tailwind_mps','headwind_mps','crosswind_mps','relative_wind_angle_deg','wind_effect','requested_forecast_hour','nearest_model_point_distance_km']];
     (lastData.samples||[]).forEach(s=>rows.push([s.km,s.eta_taipei,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,s.tailwind_mps,s.headwind_mps,s.crosswind_mps,s.relative_wind_angle_deg,s.wind_effect,s.requested_forecast_hour,s.nearest_model_point_distance_km]));
     const csv='\ufeff'+rows.map(r=>r.map(v=>{const t=String(v??'');return /[",\n]/.test(t)?`"${t.replaceAll('"','""')}"`:t}).join(',')).join('\n');
     const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));a.download=`wrf3km_forecast_${Date.now()}.csv`;a.click();URL.revokeObjectURL(a.href)
@@ -915,10 +1257,19 @@
   $('refreshRouteBtn').addEventListener('click',refreshCurrentRoute);
   $('clearUploadBtn').addEventListener('click',clearUpload);
   $('gpxFile').addEventListener('change',e=>chooseUpload(e.target.files?.[0]));
+  $('addRestKmBtn').addEventListener('click',()=>addRestPoint(Number($('restKm').value)));
+  $('mapPickBtn').addEventListener('click',()=>{
+    if(!routeGeometry.length){setRestStatus('路線尚未載入。',true);return}
+    mapPickArmed=!mapPickArmed;
+    $('mapPickBtn').textContent=mapPickArmed?'請點地圖上的位置':'在地圖點選';
+    setRestStatus(mapPickArmed?'請在地圖上點選休息位置；系統會吸附到最近路線。':'已取消地圖點選。');
+  });
+  $('addressRestBtn').addEventListener('click',searchAddressAndAdd);
+  $('clearRestsBtn').addEventListener('click',clearRestPoints);
   $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings();updateForecastWindow()});
   ['departureDate','departureTime','speed','step','startKm','endKm'].forEach(id=>{
-    $(id).addEventListener('change',()=>{saveSettings();updateForecastWindow()});
-    $(id).addEventListener('input',()=>updateForecastWindow());
+    $(id).addEventListener('change',()=>{saveSettings();updateForecastWindow();renderRestList()});
+    $(id).addEventListener('input',()=>{updateForecastWindow();renderRestList()});
   });
 
   bindTooltip('alongChart','alongHit');
@@ -931,6 +1282,8 @@
     }
   });
 
+  initMap();
+  renderRestList();
   loadSettings();
   checkApi();
   loadForecastRange();
