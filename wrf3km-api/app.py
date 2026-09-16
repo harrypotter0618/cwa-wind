@@ -24,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -1396,22 +1396,35 @@ def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
 
 def wind_effect(wd: float, ws: float, heading: float):
     """
-    Classify cycling wind by the angle between:
-      - meteorological wind FROM direction (wd)
-      - rider heading
+    Cycling-oriented wind interpretation.
 
-    0°   = direct headwind
-    90°  = pure crosswind
-    180° = direct tailwind
+    delta is the angle between meteorological wind FROM direction and rider
+    heading:
+      0°   = direct headwind
+      90°  = pure crosswind
+      180° = direct tailwind
 
-    V0.2.5 classification bands:
-      0–30°    逆風
-      30–84°   側逆風
-      84–96°   側風
-      96–150°  側順風
-      150–180° 順風
+    V0.2.9 geometric direction bands:
+      0–22.5°        逆風
+      22.5–67.5°     側逆風
+      67.5–112.5°    側風
+      112.5–157.5°   側順風
+      157.5–180°     順風
 
-    Numeric head/tail/cross components are unchanged from previous versions.
+    Geometric direction and perceived along-road effect are kept separate.
+    The signed along-road component is:
+      + = tailwind assistance
+      - = headwind resistance
+
+    UI-oriented along-road effect bands (not a meteorological standard):
+      |along| < 0.3 m/s  幾乎無感
+      0.3–1.0            輕微
+      1.0–2.0            明顯
+      2.0–3.0            強
+      >=3.0              很強
+
+    Total wind below 0.8 m/s is additionally flagged as 近無風 so a tiny
+    tailwind component is not visually overstated.
     """
     delta = abs(((wd - heading + 180.0) % 360.0) - 180.0)
 
@@ -1419,23 +1432,62 @@ def wind_effect(wd: float, ws: float, heading: float):
     head = max(0.0, raw)
     tail = max(0.0, -raw)
     cross = abs(ws * math.sin(math.radians(delta)))
+    along_signed = tail - head
 
-    if delta <= 30.0:
+    if delta <= 22.5:
         typ = "逆風"
-    elif delta < 84.0:
+    elif delta < 67.5:
         typ = "側逆風"
-    elif delta <= 96.0:
+    elif delta <= 112.5:
         typ = "側風"
-    elif delta < 150.0:
+    elif delta < 157.5:
         typ = "側順風"
     else:
         typ = "順風"
 
+    # Within the broad crosswind band, expose whether the small along-road
+    # component is slightly head- or tail-biased.
+    if typ == "側風":
+        if delta < 90.0:
+            direction_detail = "側風偏逆"
+        elif delta > 90.0:
+            direction_detail = "側風偏順"
+        else:
+            direction_detail = "純側風"
+    else:
+        direction_detail = typ
+
+    along_abs = abs(along_signed)
+    if along_abs < 0.3:
+        strength = "幾乎無感"
+    elif along_abs < 1.0:
+        strength = "輕微"
+    elif along_abs < 2.0:
+        strength = "明顯"
+    elif along_abs < 3.0:
+        strength = "強"
+    else:
+        strength = "很強"
+
+    near_calm = ws < 0.8
+
+    if near_calm:
+        display = "近無風"
+    elif along_abs < 0.3 and typ == "側風":
+        display = direction_detail
+    else:
+        display = typ
+
     return {
         "type": typ,
+        "direction_detail": direction_detail,
+        "display": display,
         "head_mps": head,
         "tail_mps": tail,
         "cross_mps": cross,
+        "along_signed_mps": along_signed,
+        "along_effect_strength": strength,
+        "near_calm": near_calm,
         "relative_angle_deg": delta,
     }
 
@@ -1490,6 +1542,7 @@ def health():
         "confirmed_range_probe": True,
         "route_geometry": True,
         "rest_point_planning": True,
+        "wind_effect_v2": True,
         "max_rest_points": MAX_REST_POINTS,
         "max_gpx_upload_mb": MAX_GPX_UPLOAD_MB,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
@@ -1546,6 +1599,7 @@ def diagnostics():
         "confirmed_range_probe": True,
         "route_geometry": True,
         "rest_point_planning": True,
+        "wind_effect_v2": True,
         "message": "Logs include U/V cache locks, GRIDMAP hits/misses, ECCODES_FAST and RANGE timings.",
     }
 
@@ -1961,6 +2015,11 @@ def _calculate_route_forecast(
             "tailwind_mps": round(effect["tail_mps"], 3),
             "crosswind_mps": round(effect["cross_mps"], 3),
             "wind_effect": effect["type"],
+            "wind_effect_detail": effect["direction_detail"],
+            "wind_effect_display": effect["display"],
+            "along_effect_mps": round(effect["along_signed_mps"], 3),
+            "along_effect_strength": effect["along_effect_strength"],
+            "near_calm": effect["near_calm"],
             "relative_wind_angle_deg": round(effect["relative_angle_deg"], 1),
             "requested_forecast_hour": round(rf, 3),
             "source_hours_used": used,
@@ -2014,7 +2073,7 @@ def _calculate_route_forecast(
             "grid_index_cache": True,
             "fast_value_array_lookup": True,
             "concurrency_safe_uv_cache": True,
-            "wind_effect_classification": "angle_bands_v1",
+            "wind_effect_classification": "angle_bands_v2_plus_along_effect_strength",
             "temporary_gpx_upload": True,
             "rest_point_planning": True,
             "route_geometry": True,
