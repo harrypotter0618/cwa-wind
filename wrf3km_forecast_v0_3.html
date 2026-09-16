@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>WRF3KM 騎乘風況預報 V0.3</title>
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#111827;
+      --panel2:#0f172a;
+      --line:#263244;
+      --text:#e5e7eb;
+      --muted:#94a3b8;
+      --accent:#38bdf8;
+      --tail:#22c55e;
+      --tail2:#84cc16;
+      --cross:#94a3b8;
+      --head2:#f59e0b;
+      --head:#ef4444;
+      --near:#64748b;
+      --shadow:0 12px 30px rgba(0,0,0,.22);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      background:linear-gradient(180deg,#07101e 0%,var(--bg) 28%,#0a1020 100%);
+      color:var(--text);
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif;
+      line-height:1.45;
+    }
+    .wrap{max-width:1280px;margin:0 auto;padding:18px}
+    header{
+      display:flex;gap:14px;align-items:flex-start;justify-content:space-between;
+      margin:6px 0 16px;
+    }
+    h1{font-size:clamp(22px,3vw,34px);margin:0 0 5px;font-weight:800;letter-spacing:.01em}
+    .subtitle{color:var(--muted);font-size:14px}
+    .version{
+      font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;
+      color:#bae6fd;background:#082f49;border:1px solid #0c4a6e;padding:6px 9px;border-radius:999px;
+      white-space:nowrap
+    }
+    .panel{
+      background:rgba(17,24,39,.92);
+      border:1px solid var(--line);
+      border-radius:16px;
+      box-shadow:var(--shadow);
+      padding:16px;
+      margin-bottom:14px;
+    }
+    .panel h2{font-size:17px;margin:0 0 12px}
+    .controls{
+      display:grid;
+      grid-template-columns:repeat(6,minmax(120px,1fr));
+      gap:10px;
+      align-items:end;
+    }
+    label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}
+    input,select,button{
+      width:100%;border-radius:10px;border:1px solid #334155;background:#0b1220;color:var(--text);
+      padding:10px 11px;font-size:14px;outline:none;
+    }
+    input:focus,select:focus{border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+    button{cursor:pointer;font-weight:700}
+    button.primary{background:#0284c7;border-color:#0284c7}
+    button.primary:hover{background:#0369a1}
+    button.secondary{background:#172033}
+    button:disabled{opacity:.5;cursor:wait}
+    .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+    .actions button{width:auto;min-width:120px}
+    .note{margin-top:10px;color:var(--muted);font-size:12px}
+    .status{
+      display:none;margin-top:12px;padding:10px 12px;border-radius:10px;
+      background:#0b2239;border:1px solid #164e63;color:#bae6fd;font-size:13px;
+    }
+    .status.error{display:block;background:#3f1115;border-color:#7f1d1d;color:#fecaca}
+    .status.show{display:block}
+    .summary-grid{
+      display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:10px;
+    }
+    .card{
+      background:var(--panel2);border:1px solid #233044;border-radius:13px;padding:12px;min-height:90px;
+    }
+    .card .k{font-size:12px;color:var(--muted);margin-bottom:5px}
+    .card .v{font-size:19px;font-weight:800}
+    .card .s{font-size:12px;color:var(--muted);margin-top:4px}
+    .lead-high{color:#86efac}.lead-midhigh{color:#bef264}.lead-mid{color:#fde68a}.lead-trend{color:#fdba74}
+    .strip{
+      display:flex;width:100%;height:30px;border-radius:9px;overflow:hidden;border:1px solid #334155;background:#0b1220
+    }
+    .seg{min-width:1px;position:relative}
+    .seg:hover{filter:brightness(1.25)}
+    .legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px;color:var(--muted);font-size:12px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px}
+    .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    .chart-box{
+      background:var(--panel2);border:1px solid #233044;border-radius:13px;padding:10px;
+    }
+    .chart-title{font-weight:700;font-size:14px;margin:0 0 7px}
+    canvas{display:block;width:100%;height:300px}
+    .tooltip{
+      position:fixed;pointer-events:none;z-index:99;display:none;
+      background:#020617;border:1px solid #475569;border-radius:9px;padding:8px 10px;
+      font-size:12px;color:#e2e8f0;box-shadow:0 8px 20px rgba(0,0,0,.35);white-space:nowrap;
+    }
+    .table-wrap{overflow:auto;border:1px solid #263244;border-radius:12px}
+    table{border-collapse:collapse;width:100%;min-width:1120px;background:#0f172a}
+    th,td{padding:9px 9px;border-bottom:1px solid #1f2937;text-align:right;font-size:12px;white-space:nowrap}
+    th{position:sticky;top:0;background:#172033;color:#cbd5e1;z-index:2}
+    th:first-child,td:first-child{text-align:left}
+    tr:hover td{background:#111d31}
+    .badge{display:inline-block;padding:3px 7px;border-radius:999px;font-weight:700;font-size:11px}
+    .b-tail{background:rgba(34,197,94,.15);color:#86efac}
+    .b-tail2{background:rgba(132,204,22,.15);color:#bef264}
+    .b-cross{background:rgba(148,163,184,.15);color:#cbd5e1}
+    .b-head2{background:rgba(245,158,11,.15);color:#fcd34d}
+    .b-head{background:rgba(239,68,68,.15);color:#fca5a5}
+    .b-near{background:rgba(100,116,139,.18);color:#cbd5e1}
+    .arrow{display:inline-block;font-size:15px;transform-origin:center}
+    .footer-note{color:var(--muted);font-size:12px;margin:14px 2px 30px}
+    .hidden{display:none!important}
+
+    @media (max-width:1000px){
+      .controls{grid-template-columns:repeat(3,1fr)}
+      .summary-grid{grid-template-columns:repeat(3,1fr)}
+      .charts{grid-template-columns:1fr}
+    }
+    @media (max-width:640px){
+      .wrap{padding:12px}
+      header{align-items:flex-start}
+      .controls{grid-template-columns:1fr 1fr}
+      .summary-grid{grid-template-columns:1fr 1fr}
+      .panel{padding:12px;border-radius:13px}
+      canvas{height:260px}
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>WRF3KM 騎乘風況預報</h1>
+      <div class="subtitle">依 GPX 路線、ETA 與 CWA WRF-3KM 計算沿線順逆風 / 側風</div>
+    </div>
+    <div class="version">UI V0.3</div>
+  </header>
+
+  <section class="panel">
+    <h2>預報設定</h2>
+    <div class="controls">
+      <div>
+        <label for="departure">出發日期時間（台灣）</label>
+        <input id="departure" type="datetime-local" />
+      </div>
+      <div>
+        <label for="speed">平均移動速度 km/h</label>
+        <input id="speed" type="number" min="5" max="60" step="0.5" value="25" />
+      </div>
+      <div>
+        <label for="step">路線取樣間距 km</label>
+        <select id="step">
+          <option value="5">5 km</option>
+          <option value="10" selected>10 km</option>
+          <option value="20">20 km</option>
+        </select>
+      </div>
+      <div>
+        <label for="startKm">起始里程 km</label>
+        <input id="startKm" type="number" min="0" step="1" value="0" />
+      </div>
+      <div>
+        <label for="endKm">結束里程 km</label>
+        <input id="endKm" type="number" min="1" step="1" value="352" />
+      </div>
+      <div>
+        <label>API</label>
+        <input value="wrf3km-api.onrender.com" disabled />
+      </div>
+    </div>
+    <div class="actions">
+      <button class="primary" id="runBtn">計算預報</button>
+      <button class="secondary" id="nowBtn">出發時間設為現在</button>
+      <button class="secondary" id="fullBtn">全程</button>
+      <button class="secondary" id="csvBtn" disabled>下載 CSV</button>
+    </div>
+    <div id="status" class="status"></div>
+    <div class="note">冷啟動或新模式輪次第一次抓取資料可能較久；已有快取時通常很快。原始 WRF3KM 網格約 3 km、模式輸出每 6 小時，本頁再依 ETA 做時間插值；把路線取樣改成 5 km 不代表氣象模式本身變成 5 km。</div>
+  </section>
+
+  <section id="results" class="hidden">
+    <section class="panel">
+      <h2>摘要</h2>
+      <div id="summary" class="summary-grid"></div>
+    </section>
+
+    <section class="panel">
+      <h2>全程風況色帶</h2>
+      <div id="strip" class="strip"></div>
+      <div class="legend">
+        <span><i class="dot" style="background:#22c55e"></i>順風</span>
+        <span><i class="dot" style="background:#84cc16"></i>側順風</span>
+        <span><i class="dot" style="background:#94a3b8"></i>側風</span>
+        <span><i class="dot" style="background:#f59e0b"></i>側逆風</span>
+        <span><i class="dot" style="background:#ef4444"></i>逆風</span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="charts">
+        <div class="chart-box">
+          <div class="chart-title">順逆風分量（+ 順風 / − 逆風）</div>
+          <canvas id="alongChart"></canvas>
+        </div>
+        <div class="chart-box">
+          <div class="chart-title">總風速與側風分量</div>
+          <canvas id="speedChart"></canvas>
+        </div>
+      </div>
+      <div class="note">圖表使用每個取樣點的 ETA 對應預報。滑鼠移到圖上可查看該里程數值。</div>
+    </section>
+
+    <section class="panel">
+      <h2>沿線明細</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>里程</th>
+              <th>ETA</th>
+              <th>模式提前量</th>
+              <th>騎乘方向</th>
+              <th>風向（FROM）</th>
+              <th>風速</th>
+              <th>順風</th>
+              <th>逆風</th>
+              <th>側風</th>
+              <th>相對角</th>
+              <th>風況</th>
+              <th>取樣格距</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="footer-note">
+      「高 / 中高 / 中 / 趨勢」僅是依模式預報提前量（lead time）做的使用提示，不是統計信賴區間或命中率。實際騎乘前仍應搭配 CWA 最新預報與即時觀測。
+    </div>
+  </section>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+(() => {
+  const API_BASE = 'https://wrf3km-api.onrender.com';
+  const $ = (id) => document.getElementById(id);
+  let lastData = null;
+  let lastRouteDistance = 352.14;
+
+  const state = {
+    alongHit: [],
+    speedHit: []
+  };
+
+  function taipeiNowLocalInput(){
+    const parts = new Intl.DateTimeFormat('sv-SE',{
+      timeZone:'Asia/Taipei', year:'numeric', month:'2-digit', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', hour12:false
+    }).formatToParts(new Date()).reduce((a,p)=>(a[p.type]=p.value,a),{});
+    return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+  }
+
+  function toTaipeiIso(localValue){
+    if(!localValue) return '';
+    return `${localValue}:00+08:00`;
+  }
+
+  function fmtDateTime(v){
+    if(!v) return '—';
+    const d = new Date(v);
+    return new Intl.DateTimeFormat('zh-TW',{
+      timeZone:'Asia/Taipei', month:'2-digit', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', hour12:false
+    }).format(d);
+  }
+
+  function fmtTime(v){
+    if(!v) return '—';
+    const d = new Date(v);
+    return new Intl.DateTimeFormat('zh-TW',{
+      timeZone:'Asia/Taipei', hour:'2-digit', minute:'2-digit', hour12:false
+    }).format(d);
+  }
+
+  function leadHours(eta, init){
+    return (new Date(eta) - new Date(init)) / 3600000;
+  }
+
+  function leadBand(h){
+    if(h <= 24) return {label:'高', cls:'lead-high'};
+    if(h <= 48) return {label:'中高', cls:'lead-midhigh'};
+    if(h <= 72) return {label:'中', cls:'lead-mid'};
+    return {label:'趨勢', cls:'lead-trend'};
+  }
+
+  function fmtLead(h){
+    if(!Number.isFinite(h)) return '—';
+    return `${h.toFixed(1)} h`;
+  }
+
+  function effectClass(effect){
+    if(effect === '順風') return 'b-tail';
+    if(effect === '側順風') return 'b-tail2';
+    if(effect === '側風') return 'b-cross';
+    if(effect === '側逆風') return 'b-head2';
+    if(effect === '逆風') return 'b-head';
+    return 'b-near';
+  }
+
+  function effectColor(effect){
+    return ({
+      '順風':'#22c55e',
+      '側順風':'#84cc16',
+      '側風':'#94a3b8',
+      '側逆風':'#f59e0b',
+      '逆風':'#ef4444'
+    })[effect] || '#64748b';
+  }
+
+  function setStatus(msg, error=false){
+    const el = $('status');
+    el.className = 'status show' + (error ? ' error' : '');
+    el.textContent = msg;
+  }
+  function clearStatus(){
+    $('status').className = 'status';
+    $('status').textContent = '';
+  }
+
+  function saveSettings(){
+    localStorage.setItem('wrf3km-ui-v03', JSON.stringify({
+      departure:$('departure').value,
+      speed:$('speed').value,
+      step:$('step').value,
+      startKm:$('startKm').value,
+      endKm:$('endKm').value
+    }));
+  }
+
+  function loadSettings(){
+    try{
+      const x = JSON.parse(localStorage.getItem('wrf3km-ui-v03') || '{}');
+      $('departure').value = x.departure || taipeiNowLocalInput();
+      $('speed').value = x.speed || 25;
+      $('step').value = x.step || 10;
+      $('startKm').value = x.startKm || 0;
+      $('endKm').value = x.endKm || 352;
+    }catch{
+      $('departure').value = taipeiNowLocalInput();
+    }
+  }
+
+  async function runForecast(){
+    saveSettings();
+    $('runBtn').disabled = true;
+    $('csvBtn').disabled = true;
+    setStatus('正在計算 WRF3KM 沿線預報… 若 Render 剛冷啟動，第一次可能需要較久。');
+
+    const speed = Number($('speed').value);
+    const step = Number($('step').value);
+    const startKm = Number($('startKm').value);
+    const endKm = Number($('endKm').value);
+    const departure = toTaipeiIso($('departure').value);
+
+    if(!(speed >= 5 && speed <= 60) || !(step >= 2) || !(endKm > startKm)){
+      setStatus('設定值有誤：請確認速度、取樣間距與起訖里程。', true);
+      $('runBtn').disabled = false;
+      return;
+    }
+
+    const u = new URL(API_BASE + '/route-forecast');
+    u.searchParams.set('speed_kmh', String(speed));
+    u.searchParams.set('step_km', String(step));
+    u.searchParams.set('start_km', String(startKm));
+    u.searchParams.set('end_km', String(endKm));
+    if(departure) u.searchParams.set('departure', departure);
+
+    const controller = new AbortController();
+    const timer = setTimeout(()=>controller.abort(), 360000);
+
+    try{
+      const t0 = performance.now();
+      const r = await fetch(u.toString(), {signal:controller.signal, cache:'no-store'});
+      const text = await r.text();
+      let data;
+      try{ data = JSON.parse(text); }catch{ throw new Error(`API 回傳不是 JSON：${text.slice(0,180)}`); }
+      if(!r.ok || !data.ok){
+        throw new Error(data?.detail?.message || data?.detail || `HTTP ${r.status}`);
+      }
+      const sec = (performance.now()-t0)/1000;
+      lastData = data;
+      lastRouteDistance = data.route?.distance_km || lastRouteDistance;
+      renderAll(data);
+      setStatus(`完成：${data.summary?.samples_available ?? 0}/${data.summary?.samples_total ?? 0} 個取樣點可用，瀏覽器等待 ${sec.toFixed(1)} 秒。`);
+      $('csvBtn').disabled = false;
+    }catch(e){
+      const msg = e.name === 'AbortError'
+        ? '逾時：等待 API 超過 6 分鐘。可先查看 Render 是否正在冷啟動或下載新模式資料。'
+        : `計算失敗：${e.message}`;
+      setStatus(msg, true);
+    }finally{
+      clearTimeout(timer);
+      $('runBtn').disabled = false;
+    }
+  }
+
+  function renderAll(data){
+    $('results').classList.remove('hidden');
+    renderSummary(data);
+    renderStrip(data.samples || []);
+    renderTable(data);
+    requestAnimationFrame(()=>{
+      drawAlongChart(data.samples || []);
+      drawSpeedChart(data.samples || []);
+    });
+  }
+
+  function renderSummary(data){
+    const s = data.summary || {};
+    const ride = data.ride || {};
+    const cycle = data.model_cycle || {};
+    const samples = data.samples || [];
+    const depLead = samples.length ? leadHours(samples[0].eta_taipei, cycle.initial_time_taipei) : NaN;
+    const arrLead = samples.length ? leadHours(samples[samples.length-1].eta_taipei, cycle.initial_time_taipei) : NaN;
+    const band = leadBand(Math.max(depLead, arrLead));
+    const durationH = (new Date(ride.estimated_arrival_taipei) - new Date(ride.departure_taipei))/3600000;
+
+    const maxTail = s.max_tailwind
+      ? `KM${s.max_tailwind.km} · ${s.max_tailwind.tailwind_mps.toFixed(1)} m/s`
+      : '無';
+    const maxHead = s.max_headwind
+      ? `KM${s.max_headwind.km} · ${s.max_headwind.headwind_mps.toFixed(1)} m/s`
+      : '無';
+
+    const cards = [
+      ['路線', `${data.route?.forecast_start_km ?? 0}–${data.route?.forecast_end_km ?? '—'} km`, `全線 ${data.route?.distance_km ?? '—'} km`],
+      ['出發 / 抵達', `${fmtDateTime(ride.departure_taipei)}`, `抵達 ${fmtDateTime(ride.estimated_arrival_taipei)} · 約 ${durationH.toFixed(1)} h`],
+      ['模式批次', `${fmtDateTime(cycle.initial_time_taipei)}`, `有效至 ${fmtDateTime(cycle.last_valid_time_taipei)}`],
+      ['預報提前量', `${fmtLead(depLead)} → ${fmtLead(arrLead)}`, `<span class="${band.cls}">使用提示：${band.label}</span>`],
+      ['最大順風', maxTail, s.max_tailwind ? `${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}` : '—'],
+      ['最大逆風', maxHead, s.max_headwind ? `${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}` : '—'],
+      ['取樣', `${s.samples_available ?? 0}/${s.samples_total ?? 0}`, `間距 ${ride.step_km ?? $('step').value} km`],
+      ['模式精細度', '約 3 km 網格', '原始時間輸出 6 h；ETA 間線性插值'],
+      ['後端', `API ${data.version || '—'}`, `模型 ${data.model || 'WRF-3KM'}`]
+    ];
+
+    $('summary').innerHTML = cards.map(([k,v,sub]) =>
+      `<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`
+    ).join('');
+  }
+
+  function renderStrip(samples){
+    if(!samples.length){ $('strip').innerHTML=''; return; }
+    const total = Math.max(1, samples[samples.length-1].km - samples[0].km);
+    $('strip').innerHTML = samples.map((x,i)=>{
+      const nextKm = samples[i+1]?.km ?? x.km + (samples[i].km - (samples[i-1]?.km ?? x.km-1));
+      const w = Math.max(.3, ((nextKm - x.km)/total)*100);
+      const title = `KM${x.km} ${fmtTime(x.eta_taipei)}｜${x.wind_effect}｜${x.wind_speed_mps.toFixed(1)} m/s｜${x.wind_direction_text}`;
+      return `<div class="seg" style="width:${w}%;background:${effectColor(x.wind_effect)}" title="${title}"></div>`;
+    }).join('');
+  }
+
+  function renderTable(data){
+    const cycleInit = data.model_cycle?.initial_time_taipei;
+    $('tbody').innerHTML = (data.samples || []).map(x=>{
+      const lh = leadHours(x.eta_taipei, cycleInit);
+      const band = leadBand(lh);
+      const flowTo = ((x.wind_direction_deg + 180) % 360).toFixed(1);
+      return `<tr>
+        <td><strong>KM${x.km}</strong></td>
+        <td>${fmtTime(x.eta_taipei)}</td>
+        <td><span class="${band.cls}">${fmtLead(lh)} · ${band.label}</span></td>
+        <td>${x.heading_text} ${x.heading_deg.toFixed(1)}°</td>
+        <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${x.wind_direction_deg.toFixed(1)}°</td>
+        <td>${x.wind_speed_mps.toFixed(2)}</td>
+        <td>${x.tailwind_mps.toFixed(2)}</td>
+        <td>${x.headwind_mps.toFixed(2)}</td>
+        <td>${x.crosswind_mps.toFixed(2)}</td>
+        <td>${Number(x.relative_wind_angle_deg ?? 0).toFixed(1)}°</td>
+        <td><span class="badge ${effectClass(x.wind_effect)}">${x.wind_effect}</span></td>
+        <td>${x.nearest_model_point_distance_km.toFixed(2)} km</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function prepCanvas(canvas){
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(320, Math.round(rect.width));
+    const h = Math.max(220, Math.round(rect.height));
+    canvas.width = Math.round(w*dpr);
+    canvas.height = Math.round(h*dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    return {ctx,w,h};
+  }
+
+  function axes(ctx,w,h,minX,maxX,minY,maxY){
+    const pad={l:46,r:14,t:12,b:34};
+    const x = v => pad.l + (v-minX)/(maxX-minX || 1)*(w-pad.l-pad.r);
+    const y = v => h-pad.b - (v-minY)/(maxY-minY || 1)*(h-pad.t-pad.b);
+
+    ctx.clearRect(0,0,w,h);
+    ctx.font='11px -apple-system,Segoe UI,sans-serif';
+    ctx.strokeStyle='#263244'; ctx.fillStyle='#94a3b8'; ctx.lineWidth=1;
+
+    const ySteps=5;
+    for(let i=0;i<=ySteps;i++){
+      const v=minY+(maxY-minY)*i/ySteps;
+      const yy=y(v);
+      ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(w-pad.r,yy);ctx.stroke();
+      ctx.fillText(v.toFixed(1),4,yy+4);
+    }
+
+    const xSpan=maxX-minX;
+    const xStep=xSpan<=60?10:xSpan<=180?30:50;
+    for(let km=Math.ceil(minX/xStep)*xStep;km<=maxX;km+=xStep){
+      const xx=x(km);
+      ctx.beginPath();ctx.moveTo(xx,pad.t);ctx.lineTo(xx,h-pad.b);ctx.stroke();
+      ctx.fillText(String(km),xx-8,h-12);
+    }
+    ctx.fillText('km',w-28,h-12);
+    return {x,y,pad};
+  }
+
+  function drawAlongChart(samples){
+    const canvas=$('alongChart');
+    const {ctx,w,h}=prepCanvas(canvas);
+    if(!samples.length) return;
+
+    const vals=samples.map(s=>s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps);
+    const minX=samples[0].km,maxX=samples[samples.length-1].km;
+    const maxAbs=Math.max(1,...vals.map(Math.abs));
+    const minY=-Math.ceil(maxAbs),maxY=Math.ceil(maxAbs);
+    const {x,y,pad}=axes(ctx,w,h,minX,maxX,minY,maxY);
+    const y0=y(0);
+
+    ctx.strokeStyle='#e2e8f0';ctx.lineWidth=1.2;
+    ctx.beginPath();ctx.moveTo(pad.l,y0);ctx.lineTo(w-pad.r,y0);ctx.stroke();
+
+    const hits=[];
+    samples.forEach((s,i)=>{
+      const v=vals[i], xx=x(s.km), yy=y(v);
+      const nextX = i<samples.length-1 ? x(samples[i+1].km) : xx+8;
+      const prevX = i>0 ? x(samples[i-1].km) : xx-8;
+      const bw=Math.max(2,Math.min(18,(nextX-prevX)*0.34));
+      ctx.fillStyle=v>=0?'#22c55e':'#ef4444';
+      ctx.fillRect(xx-bw/2,Math.min(y0,yy),bw,Math.max(1,Math.abs(y0-yy)));
+      hits.push({x:xx,y:yy,s,v});
+    });
+    state.alongHit=hits;
+  }
+
+  function drawSpeedChart(samples){
+    const canvas=$('speedChart');
+    const {ctx,w,h}=prepCanvas(canvas);
+    if(!samples.length) return;
+
+    const maxV=Math.max(2,...samples.flatMap(s=>[s.wind_speed_mps,s.crosswind_mps]));
+    const minX=samples[0].km,maxX=samples[samples.length-1].km;
+    const {x,y}=axes(ctx,w,h,minX,maxX,0,Math.ceil(maxV));
+
+    function line(key,color){
+      ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();
+      samples.forEach((s,i)=>{
+        const xx=x(s.km), yy=y(s[key]);
+        if(i===0) ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy);
+      });
+      ctx.stroke();
+      samples.forEach(s=>{
+        ctx.fillStyle=color;ctx.beginPath();ctx.arc(x(s.km),y(s[key]),2.2,0,Math.PI*2);ctx.fill();
+      });
+    }
+    line('wind_speed_mps','#38bdf8');
+    line('crosswind_mps','#f59e0b');
+
+    ctx.font='11px -apple-system,Segoe UI,sans-serif';
+    ctx.fillStyle='#38bdf8';ctx.fillText('總風速',55,23);
+    ctx.fillStyle='#f59e0b';ctx.fillText('側風',110,23);
+
+    state.speedHit=samples.map(s=>({x:x(s.km),y:y(s.wind_speed_mps),s}));
+  }
+
+  function nearestHit(canvas, hitList, evt){
+    if(!hitList?.length) return null;
+    const r=canvas.getBoundingClientRect();
+    const mx=evt.clientX-r.left;
+    let best=null,bd=Infinity;
+    hitList.forEach(h=>{
+      const d=Math.abs(mx-h.x);
+      if(d<bd){bd=d;best=h;}
+    });
+    return bd<28?best:null;
+  }
+
+  function bindTooltip(canvasId, key){
+    const c=$(canvasId), tip=$('tooltip');
+    c.addEventListener('mousemove',e=>{
+      const h=nearestHit(c,state[key],e);
+      if(!h){tip.style.display='none';return;}
+      const s=h.s;
+      const signed=s.tailwind_mps>0?s.tailwind_mps:-s.headwind_mps;
+      tip.innerHTML = `<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>
+        ${s.wind_effect}｜風 ${s.wind_speed_mps.toFixed(1)} m/s｜側風 ${s.crosswind_mps.toFixed(1)} m/s<br>
+        順逆分量 ${signed>=0?'+':''}${signed.toFixed(1)} m/s`;
+      tip.style.left=Math.min(window.innerWidth-220,e.clientX+12)+'px';
+      tip.style.top=(e.clientY+12)+'px';
+      tip.style.display='block';
+    });
+    c.addEventListener('mouseleave',()=>tip.style.display='none');
+  }
+
+  function downloadCSV(){
+    if(!lastData) return;
+    const rows=[[
+      'km','eta_taipei','heading_deg','wind_direction_deg','wind_speed_mps',
+      'tailwind_mps','headwind_mps','crosswind_mps','relative_wind_angle_deg',
+      'wind_effect','requested_forecast_hour','nearest_model_point_distance_km'
+    ]];
+    (lastData.samples||[]).forEach(s=>rows.push([
+      s.km,s.eta_taipei,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
+      s.tailwind_mps,s.headwind_mps,s.crosswind_mps,s.relative_wind_angle_deg,
+      s.wind_effect,s.requested_forecast_hour,s.nearest_model_point_distance_km
+    ]));
+    const csv='\ufeff'+rows.map(r=>r.map(v=>{
+      const t=String(v??'');
+      return /[",\n]/.test(t)?`"${t.replaceAll('"','""')}"`:t;
+    }).join(',')).join('\n');
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
+    a.download=`wrf3km_forecast_${Date.now()}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  $('runBtn').addEventListener('click',runForecast);
+  $('nowBtn').addEventListener('click',()=>{$('departure').value=taipeiNowLocalInput();saveSettings();});
+  $('fullBtn').addEventListener('click',()=>{$('startKm').value=0;$('endKm').value=Math.floor(lastRouteDistance);saveSettings();});
+  $('csvBtn').addEventListener('click',downloadCSV);
+
+  bindTooltip('alongChart','alongHit');
+  bindTooltip('speedChart','speedHit');
+
+  window.addEventListener('resize',()=>{
+    if(lastData){
+      clearTimeout(window.__wrfResizeTimer);
+      window.__wrfResizeTimer=setTimeout(()=>{
+        drawAlongChart(lastData.samples||[]);
+        drawSpeedChart(lastData.samples||[]);
+      },120);
+    }
+  });
+
+  loadSettings();
+})();
+</script>
+</body>
+</html>
