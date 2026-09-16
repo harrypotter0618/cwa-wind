@@ -24,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.9"
+VERSION = "0.2.10"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -64,6 +64,7 @@ MAX_GPX_UPLOAD_MB = int(os.getenv("MAX_GPX_UPLOAD_MB", "12"))
 MAX_REST_POINTS = int(os.getenv("MAX_REST_POINTS", "30"))
 RANGE_PROBE_CACHE_SECONDS = int(os.getenv("RANGE_PROBE_CACHE_SECONDS", "300"))
 RANGE_PROBE_MAX_FIRST_MESSAGE_MB = int(os.getenv("RANGE_PROBE_MAX_FIRST_MESSAGE_MB", "64"))
+CYCLE_FALLBACK_MAX_STEPS = int(os.getenv("CYCLE_FALLBACK_MAX_STEPS", "3"))
 _range_probe_cache = {"ts": 0.0, "result": None}
 _route_cache = {"ts": 0.0, "route": None, "source": None}
 
@@ -1390,7 +1391,9 @@ def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
         "init": got_init,
         "u": u,
         "v": v,
+        # Kept for backward compatibility with older call sites.
         "matches_latest_cycle": got_init == expected_init,
+        "matches_expected_cycle": got_init == expected_init,
     }
 
 
@@ -1543,6 +1546,7 @@ def health():
         "route_geometry": True,
         "rest_point_planning": True,
         "wind_effect_v2": True,
+        "coherent_cycle_fallback": True,
         "max_rest_points": MAX_REST_POINTS,
         "max_gpx_upload_mb": MAX_GPX_UPLOAD_MB,
         "gridmap_cache_file": str(GRIDMAP_CACHE_FILE),
@@ -1734,6 +1738,144 @@ def simplified_route_geometry(route, max_points: int = 2500):
     ]
 
 
+
+def _time_specs_for_cycle(route_samples, init_epoch_value: int):
+    """
+    Build temporal interpolation specs for one model initialization time.
+    Returns (specs, sorted_hours) or (None, None) if any ETA is outside FH000–FH084.
+    """
+    needed_hours = set()
+    specs = []
+
+    for sample in route_samples:
+        requested = sample["eta_epoch"]
+        requested_fh = (requested - init_epoch_value) / 3600.0
+
+        if requested_fh < -1e-9 or requested_fh > MAX_FH + 1e-9:
+            return None, None
+
+        lo = int(math.floor(requested_fh / STEP_H) * STEP_H)
+        hi = int(math.ceil(requested_fh / STEP_H) * STEP_H)
+        lo = max(0, min(MAX_FH, lo))
+        hi = max(0, min(MAX_FH, hi))
+
+        needed_hours.add(lo)
+        needed_hours.add(hi)
+        specs.append({
+            "available": True,
+            "requested_fh": requested_fh,
+            "lo": lo,
+            "hi": hi,
+        })
+
+    return specs, sorted(needed_hours)
+
+
+def _probe_published_cycle_for_fh(fh: int, probe_cache: dict):
+    """
+    Return the init epoch currently published at M-A0064-{fh}, using a lightweight
+    first-GRIB-message probe. A compact U/V cache is used only if the remote probe
+    itself fails.
+    """
+    if fh in probe_cache:
+        return probe_cache[fh]
+
+    try:
+        meta = _probe_remote_grib_meta(fh)
+        got = int(meta["init_epoch"])
+        probe_cache[fh] = {
+            "init_epoch": got,
+            "source": meta.get("source", "remote"),
+            "error": None,
+        }
+        return probe_cache[fh]
+    except Exception as e:
+        cached = _cached_uv_cycle(fh)
+        probe_cache[fh] = {
+            "init_epoch": cached,
+            "source": "uv_cache_fallback" if cached is not None else "probe_error",
+            "error": str(e),
+        }
+        return probe_cache[fh]
+
+
+def select_coherent_published_cycle(route_samples, latest_init: int):
+    """
+    Pick the newest *single coherent model cycle* whose currently published
+    forecast-hour files cover every route ETA.
+
+    During CWA cycle rollout, FH000 may already belong to the newest cycle while
+    FH060/FH066/... still belong to the previous cycle. In that situation this
+    function intentionally falls back 6 h (or more, up to the configured limit)
+    and remaps ETA -> FH against that older initialization. This avoids both:
+      - returning 0 usable samples merely because a new FH000 appeared; and
+      - mixing forecast hours from different initialization cycles.
+    """
+    probe_cache = {}
+    attempts = []
+
+    for step in range(0, max(0, CYCLE_FALLBACK_MAX_STEPS) + 1):
+        candidate = latest_init - step * STEP_H * 3600
+        specs, hours = _time_specs_for_cycle(route_samples, candidate)
+
+        if specs is None:
+            attempts.append({
+                "init_epoch": candidate,
+                "back_hours": step * STEP_H,
+                "status": "eta_outside_fh000_fh084",
+                "hours": [],
+            })
+            continue
+
+        mismatches = []
+        for fh in hours:
+            info = _probe_published_cycle_for_fh(fh, probe_cache)
+            got = info.get("init_epoch")
+            if got != candidate:
+                mismatches.append({
+                    "fh": fh,
+                    "got_init_epoch": got,
+                    "source": info.get("source"),
+                    "error": info.get("error"),
+                })
+
+        attempts.append({
+            "init_epoch": candidate,
+            "back_hours": step * STEP_H,
+            "status": "match" if not mismatches else "not_fully_published",
+            "hours": hours,
+            "mismatches": mismatches,
+        })
+
+        if not mismatches:
+            diag(
+                f"[CYCLE_SELECT] selected={iso_taipei(candidate)} "
+                f"latest={iso_taipei(latest_init)} "
+                f"fallback_hours={step * STEP_H} needed_fh={hours}"
+            )
+            return {
+                "selected_init": candidate,
+                "latest_init": latest_init,
+                "fallback_hours": step * STEP_H,
+                "time_specs": specs,
+                "needed_hours": hours,
+                "attempts": attempts,
+            }
+
+    diag(
+        f"[CYCLE_SELECT] no coherent cycle latest={iso_taipei(latest_init)} "
+        f"attempts={[(a['back_hours'], a['status']) for a in attempts]}"
+    )
+    return {
+        "selected_init": None,
+        "latest_init": latest_init,
+        "fallback_hours": None,
+        "time_specs": None,
+        "needed_hours": [],
+        "attempts": attempts,
+    }
+
+
 def _calculate_route_forecast(
     route,
     route_source: str,
@@ -1843,57 +1985,50 @@ def _calculate_route_forecast(
 
     coords = [(x["lat"], x["lon"]) for x in route_samples]
 
-    # Establish latest model cycle from FH0.
-    diag("[ROUTE_FORECAST] reading latest model cycle from FH000")
-    init = read_model_init(
-        route_samples[0]["lat"],
-        route_samples[0]["lon"]
-    )
+    # Determine the newest published FH000 cycle using a lightweight probe,
+    # then select the newest *coherent* published cycle that covers all ETAs.
+    # This keeps long rides usable while a fresh CWA cycle is still rolling out.
+    diag("[ROUTE_FORECAST] probing latest model cycle from remote FH000")
+    latest_meta0 = _probe_remote_grib_meta(0)
+    latest_init = int(latest_meta0["init_epoch"])
+
+    cycle_pick = select_coherent_published_cycle(route_samples, latest_init)
+    if cycle_pick["selected_init"] is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "NO_COHERENT_PUBLISHED_CYCLE",
+                "message": (
+                    "CWA WRF-3KM is currently between model-cycle rollouts. "
+                    "No single published cycle can yet cover the full requested ride. "
+                    "Please retry after the next forecast hours are published, "
+                    "or choose a nearer departure time."
+                ),
+                "latest_cycle_taipei": iso_taipei(latest_init),
+                "attempts": [
+                    {
+                        "cycle_taipei": iso_taipei(a["init_epoch"]),
+                        "fallback_hours": a["back_hours"],
+                        "status": a["status"],
+                        "needed_hours": a.get("hours", []),
+                    }
+                    for a in cycle_pick["attempts"]
+                ],
+            },
+        )
+
+    init = int(cycle_pick["selected_init"])
     model_end = init + MAX_FH * 3600
+    time_specs = cycle_pick["time_specs"]
+    sorted_hours = cycle_pick["needed_hours"]
+
     diag(
-        f"[ROUTE_FORECAST] model cycle init={iso_taipei(init)} "
-        f"valid_until={iso_taipei(model_end)}"
+        f"[ROUTE_FORECAST] selected cycle init={iso_taipei(init)} "
+        f"latest_cycle={iso_taipei(latest_init)} "
+        f"fallback_hours={cycle_pick['fallback_hours']} "
+        f"valid_until={iso_taipei(model_end)} "
+        f"needed_fh={sorted_hours}"
     )
-
-    needed_hours = set()
-    time_specs = []
-
-    for sample in route_samples:
-        requested = sample["eta_epoch"]
-        requested_fh = (requested - init) / 3600.0
-
-        if requested_fh < 0:
-            time_specs.append({
-                "available": False,
-                "reason": "BEFORE_FORECAST_RANGE",
-                "requested_fh": requested_fh,
-            })
-            continue
-
-        if requested_fh > MAX_FH:
-            time_specs.append({
-                "available": False,
-                "reason": "AFTER_FORECAST_RANGE",
-                "requested_fh": requested_fh,
-            })
-            continue
-
-        lo = int(math.floor(requested_fh / STEP_H) * STEP_H)
-        hi = int(math.ceil(requested_fh / STEP_H) * STEP_H)
-        lo = max(0, min(MAX_FH, lo))
-        hi = max(0, min(MAX_FH, hi))
-
-        needed_hours.add(lo)
-        needed_hours.add(hi)
-        time_specs.append({
-            "available": True,
-            "requested_fh": requested_fh,
-            "lo": lo,
-            "hi": hi,
-        })
-
-    sorted_hours = sorted(needed_hours)
-    diag(f"[ROUTE_FORECAST] needed forecast hours={sorted_hours}")
 
     # V0.2.3: nearest-grid search is done once for these route coordinates.
     # If mapping creation fails on an unexpected ecCodes build, preserve
@@ -1913,7 +2048,7 @@ def _calculate_route_forecast(
         fields[fh] = load_uv_many_for_cycle(fh, coords, init, gridmap)
         diag(
             f"[ROUTE_FORECAST] fh={fh:03d} done "
-            f"cycle_ok={fields[fh]['matches_latest_cycle']} "
+            f"cycle_ok={fields[fh].get('matches_expected_cycle', fields[fh]['matches_latest_cycle'])} "
             f"elapsed={time.time()-fh_t0:.1f}s"
         )
 
@@ -1947,8 +2082,8 @@ def _calculate_route_forecast(
 
         low = fields[lo]
         high = fields[hi]
-        low_ok = low["matches_latest_cycle"]
-        high_ok = high["matches_latest_cycle"]
+        low_ok = low.get("matches_expected_cycle", low["matches_latest_cycle"])
+        high_ok = high.get("matches_expected_cycle", high["matches_latest_cycle"])
 
         degraded = False
         fallback_reason = None
@@ -2074,6 +2209,7 @@ def _calculate_route_forecast(
             "fast_value_array_lookup": True,
             "concurrency_safe_uv_cache": True,
             "wind_effect_classification": "angle_bands_v2_plus_along_effect_strength",
+            "coherent_cycle_fallback": True,
             "temporary_gpx_upload": True,
             "rest_point_planning": True,
             "route_geometry": True,
@@ -2109,6 +2245,10 @@ def _calculate_route_forecast(
         },
         "model_cycle": {
             "initial_time_taipei": iso_taipei(init),
+            "selected_initial_time_taipei": iso_taipei(init),
+            "latest_initial_time_taipei": iso_taipei(latest_init),
+            "fallback_from_latest_hours": cycle_pick["fallback_hours"],
+            "using_fallback_cycle": bool(cycle_pick["fallback_hours"]),
             "last_valid_time_taipei": iso_taipei(model_end),
         },
         "summary": summary,
@@ -2292,8 +2432,8 @@ def wind(
     else:
         high = load_uv_for_cycle(hi, lat, lon, init)
 
-    low_ok = low["matches_latest_cycle"]
-    high_ok = high["matches_latest_cycle"]
+    low_ok = low.get("matches_expected_cycle", low["matches_latest_cycle"])
+    high_ok = high.get("matches_expected_cycle", high["matches_latest_cycle"])
 
     if lo == hi and low_ok:
         u = low["u"]["value"]
