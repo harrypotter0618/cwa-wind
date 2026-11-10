@@ -24,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -44,7 +44,7 @@ MAX_CACHE_MB = int(os.getenv("MAX_CACHE_MB", "450"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
 UV_CACHE_TTL = int(os.getenv("UV_CACHE_TTL_SECONDS", "1200"))
 KEEP_FULL_GRIB = os.getenv("KEEP_FULL_GRIB", "false").strip().lower() in {"1","true","yes","on"}
-UV_CACHE_DIR = CACHE_DIR / "uv10"
+UV_CACHE_DIR = CACHE_DIR / "uv10_t2_v1"
 UV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # V0.2.3: cache route-coordinate -> WRF grid indices + IDW weights.
@@ -294,7 +294,7 @@ def _uv_cache_is_fresh(uv_path: Path, meta_path: Path, fh: int):
 
 def build_uv10_cache(fh: int, force: bool = False):
     """
-    Extract only 10 m U/V from the large CWA GRIB2 file.
+    Extract 10 m U/V and optional 2 m temperature from the large CWA GRIB2 file.
 
     V0.2.4 concurrency safety:
     - one in-process builder per forecast hour
@@ -368,12 +368,12 @@ def build_uv10_cache(fh: int, force: bool = False):
                                 "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
                             }
 
-                        comp = classify_uv_message(gid)
+                        comp = classify_uv_message(gid) or ("t2" if is_temperature_message(gid) else None)
                         if comp and comp not in found:
                             codes_write(gid, out)
                             found.add(comp)
 
-                        if "u" in found and "v" in found:
+                        if {"u", "v", "t2"}.issubset(found):
                             break
                     finally:
                         codes_release(gid)
@@ -400,6 +400,7 @@ def build_uv10_cache(fh: int, force: bool = False):
             if not meta:
                 raise RuntimeError("No GRIB metadata found while extracting U/V")
 
+            meta["temperature_available"] = "t2" in found
             meta["init_epoch"] = init_epoch(meta)
             meta["forecast_hour"] = fh
             meta["created_at_epoch"] = int(time.time())
@@ -681,6 +682,68 @@ def classify_uv_message(gid) -> Optional[str]:
             return "v"
 
     return None
+
+
+def is_temperature_message(gid):
+    """Select air temperature at 2 m AGL, never skin/dew-point temperature."""
+    level = safe_get(gid, "level", None)
+    try:
+        is_2m = abs(float(level) - 2.0) < 0.01
+    except (TypeError, ValueError):
+        return False
+    short = str(safe_get(gid, "shortName", "")).lower()
+    name = str(safe_get(gid, "name", "")).lower()
+    agl = str(safe_get(gid, "typeOfLevel", "")).lower() == "heightaboveground"
+    return is_2m and agl and (short in {"2t", "t2m", "t"} or name in {"temperature", "2 metre temperature"})
+
+
+def temperature_celsius(value, units):
+    if not math.isfinite(value):
+        return None
+    if units in {"K", "kelvin"}:
+        value -= 273.15
+    elif units not in {"C", "degC", "Celsius", "°C"}:
+        return None
+    return value if -100 <= value <= 70 else None
+
+
+def read_temperature_many(path, coords, expected_init, gridmap=None):
+    """Missing fields/cells remain null; temperature must use the wind cycle."""
+    missing = [None] * len(coords)
+    with open(path, "rb") as f:
+        while True:
+            gid = codes_grib_new_from_file(f)
+            if gid is None:
+                return missing
+            try:
+                if not is_temperature_message(gid):
+                    continue
+                meta = {"dataDate": codes_get(gid, "dataDate"), "dataTime": codes_get(gid, "dataTime")}
+                if init_epoch(meta) != expected_init:
+                    return missing
+                units = str(safe_get(gid, "units", ""))
+                if gridmap and grid_fingerprint(gid) == gridmap["fingerprint"]:
+                    raw = codes_get_array(gid, "values")
+                    clean = [temperature_celsius(float(v), units) for v in raw]
+                    vals, _ = apply_grid_mappings([v if v is not None else math.nan for v in clean], gridmap)
+                    units = "C"
+                else:
+                    vals, point_sets = idw4_many(gid, coords)
+                    vals = [v if all(temperature_celsius(float(p["value"]), units) is not None for p in pts) else math.nan
+                            for v, pts in zip(vals, point_sets)]
+                return [temperature_celsius(float(v), units) for v in vals]
+            finally:
+                codes_release(gid)
+
+
+def interpolate_temperature(fields, used_hours, alpha, index):
+    values = [fields[fh].get("temperature_c", [])[index]
+              if index < len(fields[fh].get("temperature_c", [])) else None
+              for fh in used_hours]
+    if not values or any(v is None for v in values):
+        return None
+    value = values[0] if len(values) == 1 else values[0] + alpha * (values[1] - values[0])
+    return round(value, 1)
 
 
 def read_uv(path: Path, lat: float, lon: float):
@@ -1386,11 +1449,18 @@ def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
         else:
             _, u, v = read_uv_many(uv_path, coords)
 
+    try:
+        temperatures = read_temperature_many(uv_path, coords, expected_init, gridmap)
+    except Exception as e:
+        diag(f"[TEMPERATURE] unavailable fh={fh:03d}: {e}")
+        temperatures = [None] * len(coords)
+
     return {
         "fh": fh,
         "init": got_init,
         "u": u,
         "v": v,
+        "temperature_c": temperatures,
         # Kept for backward compatibility with older call sites.
         "matches_latest_cycle": got_init == expected_init,
         "matches_expected_cycle": got_init == expected_init,
@@ -2143,6 +2213,7 @@ def _calculate_route_forecast(
             "available": True,
             "degraded": degraded,
             "fallback_reason": fallback_reason,
+            "temperature_c": interpolate_temperature(fields, used, alpha, i),
             "wind_speed_mps": round(ws, 3),
             "wind_direction_deg": round(wd, 1),
             "wind_direction_text": dir_text(wd),
@@ -2172,7 +2243,15 @@ def _calculate_route_forecast(
     if max_tail and max_tail["tailwind_mps"] <= 0.05:
         max_tail = None
 
+    temperatures = [x for x in available if x.get("temperature_c") is not None]
+    def temperature_extreme(fn):
+        point = fn(temperatures, key=lambda x: x["temperature_c"], default=None)
+        return {k: point[k] for k in ("temperature_c", "km", "eta_taipei")} if point else None
+
     summary = {
+        "min_temperature": temperature_extreme(min),
+        "max_temperature": temperature_extreme(max),
+        "temperature_samples_available": len(temperatures),
         "samples_total": len(output),
         "samples_available": len(available),
         "samples_degraded": degraded_count,

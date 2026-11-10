@@ -156,7 +156,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.3</div>
+    <div class="version">UI V0.4.4</div>
   </header>
 
   <section class="panel">
@@ -328,7 +328,11 @@
           <canvas id="speedChart"></canvas>
         </div>
       </div>
-      <div class="note">滑鼠移到圖上可查看該里程數值。</div>
+      <div class="chart-box" style="margin-top:14px">
+        <div class="chart-title">沿途預報氣溫（°C）</div>
+        <canvas id="temperatureChart"></canvas>
+      </div>
+      <div class="note">氣溫為離地 2 公尺預報，依含休息的 ETA 配對；高低溫為沿途取樣值，缺值不連線。滑鼠移到圖上可查看里程與時間。</div>
     </section>
 
     <section class="panel">
@@ -338,7 +342,7 @@
           <thead>
             <tr>
               <th>里程</th><th>ETA</th><th>累計休息</th><th>模式提前量</th><th>騎乘方向</th>
-              <th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
+              <th>預報氣溫 °C</th><th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
               <th>側風</th><th>沿線效益</th><th>相對角</th><th>方向分類</th><th>騎乘感受</th><th>取樣格距</th>
             </tr>
           </thead>
@@ -585,7 +589,7 @@
         const pts=geometryBetween(a.km,b.km);
         if(pts.length<2) continue;
         L.polyline(pts,{color:effectColorSample(a),weight:7,opacity:.95})
-          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(effectDisplay(a))}<br>總風速 ${a.wind_speed_mps.toFixed(1)} m/s · 沿線 ${alongEffectValue(a)>=0?'+':''}${alongEffectValue(a).toFixed(2)} m/s<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
+          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(effectDisplay(a))}<br>總風速 ${a.wind_speed_mps.toFixed(1)} m/s · 沿線 ${alongEffectValue(a)>=0?'+':''}${alongEffectValue(a).toFixed(2)} m/s<br>預報氣溫 ${formatTemperature(a.temperature_c)}<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
           .addTo(windRouteLayer);
       }
     }
@@ -1134,7 +1138,12 @@
     requestAnimationFrame(()=>{
       drawAlongChart(data.samples||[]);
       drawSpeedChart(data.samples||[]);
+      drawTemperatureChart(data.samples||[]);
     });
+  }
+
+  function formatTemperature(value){
+    return typeof value === "number" && Number.isFinite(value) ? value.toFixed(1)+" °C" : "—";
   }
 
   function renderSummary(data){
@@ -1160,6 +1169,7 @@
       ['預報提前量',`${fmtLead(depLead)} → ${fmtLead(arrLead)}`,`<span class="${band.cls}">使用提示：${band.label}</span>`],
       ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
       ['最大逆風',maxHead,s.max_headwind?`${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}`:'—'],
+      ...['min_temperature','max_temperature'].map((key,i)=>[i?'沿途預報最高溫':'沿途預報最低溫',formatTemperature(s[key]?.temperature_c),s[key]?`KM${s[key].km} · ${fmtTime(s[key].eta_taipei)} · 有效氣溫 ${s.temperature_samples_available}/${s.samples_total}`:'氣溫資料尚未提供']),
       ['模式精細度','約 3 km 網格','原始時間輸出 6 h；ETA 間插值'],
       ['後端',`API ${data.version||'—'}`,data.model||'WRF-3KM']
     ];
@@ -1196,7 +1206,7 @@
 
       if(!x.available){
         return `<tr>${baseStart}
-          <td colspan="10"><span class="badge b-near">暫無可用模式資料</span> ${escapeHtml(x.reason||'UNAVAILABLE')}</td>
+          <td colspan="11"><span class="badge b-near">暫無可用模式資料</span> ${escapeHtml(x.reason||'UNAVAILABLE')}</td>
         </tr>`;
       }
 
@@ -1204,6 +1214,7 @@
       const along=alongEffectValue(x);
       return `<tr>
         ${baseStart}
+        <td>${formatTemperature(x.temperature_c)}</td>
         <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${Number(x.wind_direction_deg).toFixed(1)}°</td>
         <td>${Number(x.wind_speed_mps).toFixed(2)}</td>
         <td>${Number(x.tailwind_mps).toFixed(2)}</td>
@@ -1283,6 +1294,23 @@
     state.speedHit=valid.map(s=>({x:x(s.km),y:y(Number(s.wind_speed_mps)),s}))
   }
 
+  function drawTemperatureChart(samples){
+    const {ctx,w,h}=prepCanvas($('temperatureChart'));
+    const valid=samples.filter(s=>s.available && typeof s.temperature_c==='number' && Number.isFinite(s.temperature_c));
+    state.temperatureHit=[];
+    if(!valid.length){ctx.clearRect(0,0,w,h);ctx.fillStyle='#94a3b8';ctx.fillText('目前沒有可用的氣溫預報',20,30);return;}
+    const vals=valid.map(s=>s.temperature_c);
+    const {x,y}=axes(ctx,w,h,samples[0].km,samples[samples.length-1].km,Math.floor(Math.min(...vals))-1,Math.ceil(Math.max(...vals))+1);
+    ctx.strokeStyle='#fb923c';ctx.lineWidth=2;ctx.beginPath();let connected=false;
+    samples.forEach(s=>{
+      if(!s.available || typeof s.temperature_c!=='number' || !Number.isFinite(s.temperature_c)){connected=false;return;}
+      const xx=x(s.km),yy=y(s.temperature_c);
+      connected?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);connected=true;
+      state.temperatureHit.push({x:xx,y:yy,s});
+    });ctx.stroke();
+    state.temperatureHit.forEach(p=>{ctx.fillStyle='#fb923c';ctx.beginPath();ctx.arc(p.x,p.y,2.5,0,Math.PI*2);ctx.fill();});
+  }
+
   function nearestHit(canvas,list,e){
     if(!list?.length)return null;const r=canvas.getBoundingClientRect(),mx=e.clientX-r.left;
     let best=null,bd=Infinity;list.forEach(h=>{const d=Math.abs(mx-h.x);if(d<bd){bd=d;best=h}});return bd<28?best:null
@@ -1294,6 +1322,7 @@
       const h=nearestHit(c,state[key],e);if(!h){tip.style.display='none';return}
       const s=h.s,signed=Number(s.tailwind_mps)>0?Number(s.tailwind_mps):-Number(s.headwind_mps);
       tip.innerHTML=`<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>${s.wind_effect_detail||s.wind_effect}｜風 ${Number(s.wind_speed_mps).toFixed(1)} m/s｜側風 ${Number(s.crosswind_mps).toFixed(1)} m/s<br>順逆分量 ${signed>=0?'+':''}${signed.toFixed(1)} m/s`;
+      if(key==='temperatureHit')tip.innerHTML=`<strong>KM${s.km}</strong> · ${fmtTime(s.eta_taipei)}<br>預報氣溫 ${formatTemperature(s.temperature_c)}`;
       tip.style.left=Math.min(window.innerWidth-220,e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';tip.style.display='block'
     });
     c.addEventListener('mouseleave',()=>tip.style.display='none')
@@ -1303,7 +1332,7 @@
     if(!lastData)return;
     const rows=[[
       'km','eta_taipei','rest_delay_minutes','available','reason',
-      'heading_deg','wind_direction_deg','wind_speed_mps',
+      'temperature_c','heading_deg','wind_direction_deg','wind_speed_mps',
       'tailwind_mps','headwind_mps','crosswind_mps',
       'along_effect_mps','relative_wind_angle_deg',
       'wind_effect','wind_effect_detail','along_effect_strength','near_calm',
@@ -1311,7 +1340,7 @@
     ]];
     (lastData.samples||[]).forEach(s=>rows.push([
       s.km,s.eta_taipei,s.rest_delay_minutes,s.available,s.reason,
-      s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
+      s.temperature_c,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
       s.tailwind_mps,s.headwind_mps,s.crosswind_mps,
       s.along_effect_mps,s.relative_wind_angle_deg,
       s.wind_effect,s.wind_effect_detail,s.along_effect_strength,s.near_calm,
@@ -1344,11 +1373,12 @@
 
   bindTooltip('alongChart','alongHit');
   bindTooltip('speedChart','speedHit');
+  bindTooltip('temperatureChart','temperatureHit');
 
   window.addEventListener('resize',()=>{
     if(lastData){
       clearTimeout(window.__resizeTimer);
-      window.__resizeTimer=setTimeout(()=>{drawAlongChart(lastData.samples||[]);drawSpeedChart(lastData.samples||[])},120)
+      window.__resizeTimer=setTimeout(()=>{drawAlongChart(lastData.samples||[]);drawSpeedChart(lastData.samples||[]);drawTemperatureChart(lastData.samples||[])},120)
     }
   });
 
