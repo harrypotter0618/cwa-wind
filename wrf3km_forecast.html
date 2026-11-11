@@ -156,7 +156,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.4</div>
+    <div class="version">UI V0.4.5</div>
   </header>
 
   <section class="panel">
@@ -275,6 +275,9 @@
     <div class="map-actions">
       <button id="addRestKmBtn" class="secondary">依里程加入</button>
       <button id="mapPickBtn" class="secondary">在地圖點選</button>
+      <button id="readRouteStopsBtn" class="secondary">讀取目前 GPX 的補給點</button>
+      <button id="importStopsBtn" class="secondary">從 GPX／KML 匯入補給點</button>
+      <input id="stopsFile" type="file" accept=".gpx,.kml" hidden>
       <button id="clearRestsBtn" class="danger">清除休息點</button>
     </div>
 
@@ -293,6 +296,8 @@
     <div class="map-hint">
       預報前先顯示完整 GPX 路線；計算完成後依「沿騎乘方向的實際順逆風分量」分段上色，不畫風向箭頭。
       休息點可用「里程」或「地圖點選」加入；地圖點選會自動吸附到最近路線。
+      同一路線的休息點會自動儲存在此瀏覽器，重新開啟或切回路線會帶回；清除瀏覽器資料或換裝置不會同步。清除休息點只影響目前路線。<br>
+      可讀取 GPX 的 wpt／rtept 或 KML 的 Point 補給點，以新增區的分鐘數匯入，再於下方逐站修改；僅有軌跡的檔案無法自動辨識休息站。<br>
       休息時間會加入後續 ETA，因此後半段 WRF 預報時間也會跟著延後。
     </div>
     <div id="restList" class="rest-list"></div>
@@ -376,6 +381,46 @@
   let lastData = null;
   let forecastRange = null;
   let restPoints = [];
+  let activePlanKey = null;
+  let currentRouteSource = 'https://raw.githubusercontent.com/harrypotter0618/cwa-wind/main/ride-api/routes/current.gpx';
+  const PLAN_STORE = 'wrf3km-rest-plans-v1';
+
+  function routePlanKey(points){
+    if(points.length<2) return null;
+    const text=points.map(p=>`${p.lat.toFixed(6)},${p.lon.toFixed(6)},${p.km.toFixed(3)}`).join(';');
+    let a=2166136261,b=5381;
+    for(let i=0;i<text.length;i++){a=Math.imul(a^text.charCodeAt(i),16777619);b=Math.imul(b,33)^text.charCodeAt(i);}
+    return `${points.length}-${a>>>0}-${b>>>0}`;
+  }
+
+  function readPlans(){
+    try{const x=JSON.parse(localStorage.getItem(PLAN_STORE)||'{}');return x&&typeof x==='object'&&!Array.isArray(x)?x:{};}catch{return {};}
+  }
+
+  function saveRestPlan(){
+    if(!activePlanKey) return;
+    try{const plans=readPlans();plans[activePlanKey]={points:restPoints,updated:Date.now()};localStorage.setItem(PLAN_STORE,JSON.stringify(plans));}
+    catch{setRestStatus('瀏覽器無法儲存休息點；本次仍可計算，關閉後可能不會保留。',true);}
+  }
+
+  function activateRestPlan(){
+    const key=routePlanKey(routeGeometry);
+    if(key===activePlanKey) return;
+    saveRestPlan();activePlanKey=key;
+    const saved=key?readPlans()[key]?.points:[];
+    const end=routeGeometry.at(-1)?.km||0;
+    restPoints=Array.isArray(saved)?saved.filter(r=>Number.isFinite(r.km)&&r.km>0&&r.km<end&&Number.isFinite(r.minutes)&&r.minutes>=1&&r.minutes<=360&&Number.isFinite(r.lat)&&Number.isFinite(r.lon)).slice(0,30):[];
+    resetPlanningForRoute(restPoints.length?`已帶回這條路線的 ${restPoints.length} 個休息點，可直接修改分鐘數。`:'這條路線尚未設定休息點；加入後會自動記住。');
+  }
+
+  function editRestMinutes(id,value){
+    const minutes=Number(value);
+    if(!Number.isInteger(minutes)||minutes<1||minutes>360){setRestStatus('休息時間需為 1–360 的整數分鐘。',true);renderRestList();return;}
+    const point=restPoints.find(r=>String(r.id)===String(id));
+    if(!point) return;
+    point.minutes=minutes;saveRestPlan();invalidateForecast('休息時間已儲存，請重新計算預報。');renderRestList();drawRouteMap();
+  }
+
   let mapPickArmed = false;
   let map = null;
   let baseRouteLayer = null;
@@ -420,14 +465,14 @@
       .map(p=>Array.isArray(p)?{lat:Number(p[0]),lon:Number(p[1]),km:Number(p[2])}:p)
       .filter(p=>Number.isFinite(p.lat)&&Number.isFinite(p.lon)&&Number.isFinite(p.km))
       .sort((a,b)=>a.km-b.km);
+    activateRestPlan();
     drawRouteMap();
     if(map && fit && routeGeometry.length>1){
       map.fitBounds(L.latLngBounds(routeGeometry.map(p=>[p.lat,p.lon])),{padding:[18,18]});
     }
   }
 
-  function resetPlanningForRoute(message='路線已切換，已清除原休息點。'){
-    restPoints=[];
+  function resetPlanningForRoute(message='已切換路線，套用此路線的休息點。'){
     lastData=null;
     $('results').classList.add('hidden');
     $('csvBtn').disabled=true;
@@ -525,10 +570,12 @@
     const p=(Number.isFinite(lat)&&Number.isFinite(lon))?{lat,lon}:pointAtRouteKm(km);
     if(!p) return setRestStatus('目前尚未載入路線幾何，無法加入休息點。',true);
 
+    if(restPoints.length>=30) return setRestStatus('最多可設定 30 個休息點。',true);
     const customName=$('restName').value.trim();
     const name=customName||`休息點 ${restPoints.length+1}`;
     restPoints.push({id:Date.now()+Math.random(),km,minutes,name,lat:p.lat,lon:p.lon});
     restPoints.sort((a,b)=>a.km-b.km);
+    saveRestPlan();
     $('restKm').value='';
     $('restName').value='';
     renderRestList();
@@ -538,12 +585,13 @@
 
   function removeRestPoint(id){
     restPoints=restPoints.filter(r=>String(r.id)!==String(id));
+    saveRestPlan();
     renderRestList();drawRouteMap();invalidateForecast('已移除休息點，請重新計算預報。');
   }
 
   function clearRestPoints(){
     if(!restPoints.length){setRestStatus('目前沒有休息點。');return}
-    restPoints=[];renderRestList();drawRouteMap();invalidateForecast('已清除全部休息點。');
+    restPoints=[];saveRestPlan();renderRestList();drawRouteMap();invalidateForecast('已清除全部休息點。');
   }
 
   function timedRestFor(r){
@@ -559,8 +607,9 @@
     el.innerHTML=restPoints.map(r=>{
       const t=timedRestFor(r),inside=r.km>bounds.start&&r.km<bounds.end;
       const timing=t?` · 抵達 ${fmtTime(t.arrival_taipei)} → ${fmtTime(t.departure_taipei)}`:'';
-      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · ${r.minutes} 分</div><div class="rest-sub">${inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
+      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · <label style="display:inline">休息 <input aria-label="${escapeHtml(r.name)}休息分鐘" data-rest-minutes="${r.id}" type="number" min="1" max="360" step="1" value="${r.minutes}" style="width:78px;display:inline-block"> 分</label></div><div class="rest-sub">${inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
     }).join('');
+    el.querySelectorAll('[data-rest-minutes]').forEach(input=>input.addEventListener('change',()=>editRestMinutes(input.dataset.restMinutes,input.value)));
     el.querySelectorAll('[data-rest-remove]').forEach(btn=>btn.addEventListener('click',()=>removeRestPoint(btn.dataset.restRemove)));
     renderRestMarkers();
   }
@@ -836,6 +885,7 @@
       currentGeometry=(g.points||[]).map(p=>({lat:Number(p[0]),lon:Number(p[1]),km:Number(p[2])}));
       $('currentDistance').textContent=`${currentDistanceKm.toFixed(2)} km`;
       $('currentSource').textContent=d.source || 'GitHub current.gpx';
+      if(d.source) currentRouteSource=d.source;
       if(routeMode==='current'){setRouteGeometry(currentGeometry,true);updateRouteUI()}
       updateForecastWindow();
     }catch(e){
@@ -878,6 +928,47 @@
     return {distance:total,points:raw.length,geometry};
   }
 
+  function importStopXml(text,expectedKey){
+    if(!activePlanKey || activePlanKey!==expectedKey) throw new Error('路線已切換，請在目前路線重新匯入。');
+    const xml=new DOMParser().parseFromString(text,'application/xml');
+    if(xml.querySelector('parsererror')) throw new Error('補給點檔案 XML 解析失敗');
+    const named=n=>n.getElementsByTagNameNS('*','name')[0]?.textContent?.trim()||'補給點';
+    let candidates=[...xml.getElementsByTagNameNS('*','wpt')];
+    if(!candidates.length) candidates=[...xml.getElementsByTagNameNS('*','rtept')];
+    const number=v=>v!==null&&String(v).trim()!==''?Number(v):NaN;
+    let stops=candidates.map(n=>({name:named(n),lat:number(n.getAttribute('lat')),lon:number(n.getAttribute('lon'))}));
+    for(const p of xml.getElementsByTagNameNS('*','Placemark')){
+      const point=p.getElementsByTagNameNS('*','Point')[0];
+      const coord=point?.getElementsByTagNameNS('*','coordinates')[0]?.textContent.trim().split(/\s+/)[0].split(',');
+      if(coord) stops.push({name:named(p),lon:number(coord[0]),lat:number(coord[1])});
+    }
+    if(!stops.length) throw new Error('檔案沒有補給點標記（GPX wpt／rtept 或 KML Point）；請先用里程或地圖加入，之後會自動記住。');
+    if(stops.length>300) throw new Error('檔案有超過 300 個標記，可能是軌跡節點；請提供只含補給點的 GPX／KML。');
+    const minutes=Number($('restMinutes').value);
+    if(!Number.isInteger(minutes)||minutes<1||minutes>360) throw new Error('請先設定 1–360 的整數休息分鐘。');
+    let added=0,skipped=0;
+    for(const stop of stops){
+      if(!Number.isFinite(stop.lat)||!Number.isFinite(stop.lon)||Math.abs(stop.lat)>90||Math.abs(stop.lon)>180){skipped++;continue;}
+      const snap=nearestOnRoute(stop.lat,stop.lon);
+      if(!snap||snap.distanceKm>1||snap.km<=0||snap.km>=routeGeometry.at(-1).km||restPoints.some(r=>Math.abs(r.km-snap.km)<.05)||restPoints.length>=30){skipped++;continue;}
+      restPoints.push({id:Date.now()+Math.random(),name:stop.name,km:snap.km,minutes,lat:snap.lat,lon:snap.lon});added++;
+    }
+    restPoints.sort((a,b)=>a.km-b.km);saveRestPlan();
+    invalidateForecast(`已匯入 ${added} 個補給點，各 ${minutes} 分；略過 ${skipped} 個（重複、離路線超過 1 km、起終點或超過 30 點）。可在下方逐站修改時間。`);
+    renderRestList();drawRouteMap();
+  }
+
+  async function readRouteStops(){
+    const key=activePlanKey,file=temporaryFile,mode=routeMode;
+    if(!key) return setRestStatus('請先載入路線。',true);
+    try{
+      let text;
+      if(mode==='upload'&&file) text=await file.text();
+      else {const r=await fetch(currentRouteSource);if(!r.ok)throw new Error(`讀取 GPX 失敗：HTTP ${r.status}`);text=await r.text();}
+      importStopXml(text,key);
+    }catch(e){setRestStatus(e.message,true);}
+  }
+
   function updateRouteUI(){
     const isUpload=routeMode==='upload';
     $('currentCard').classList.toggle('active',!isUpload);
@@ -894,7 +985,7 @@
     routeMode='current';
     setRouteGeometry(currentGeometry,changed);
     updateRouteUI();
-    if(changed) resetPlanningForRoute();
+
   }
 
   async function chooseUpload(file){
@@ -910,7 +1001,7 @@
       $('clearUploadBtn').disabled=false;
       setRouteGeometry(temporaryGeometry,true);
       updateRouteUI();
-      resetPlanningForRoute('已切換到臨時 GPX，已清除原休息點。');
+
       updateForecastWindow();
       setStatus('臨時 GPX 已載入。按「計算預報」時才會上傳給 Render；不會覆蓋 current.gpx。');
     }catch(e){
@@ -1363,6 +1454,12 @@
     mapPickArmed=!mapPickArmed;
     $('mapPickBtn').textContent=mapPickArmed?'請點地圖上的位置':'在地圖點選';
     setRestStatus(mapPickArmed?'請在地圖上點選休息位置；系統會吸附到最近路線。':'已取消地圖點選。');
+  });
+  $('readRouteStopsBtn').addEventListener('click',readRouteStops);
+  $('importStopsBtn').addEventListener('click',()=>$('stopsFile').click());
+  $('stopsFile').addEventListener('change',async e=>{
+    const file=e.target.files?.[0],key=activePlanKey;if(!file)return;
+    try{importStopXml(await file.text(),key);}catch(err){setRestStatus(err.message,true);}finally{e.target.value='';}
   });
   $('clearRestsBtn').addEventListener('click',clearRestPoints);
   $('customSegmentToggle').addEventListener('change',()=>{toggleSegment();saveSettings();updateForecastWindow()});
