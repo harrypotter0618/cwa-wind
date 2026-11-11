@@ -264,7 +264,7 @@
       </div>
       <div>
         <label for="restMinutes">休息時間（分鐘）</label>
-        <input id="restMinutes" type="number" min="1" max="360" step="1" value="10">
+        <input id="restMinutes" type="number" min="0" max="360" step="1" value="0">
       </div>
       <div>
         <label for="restKm">里程 km（可直接加入）</label>
@@ -297,7 +297,7 @@
       預報前先顯示完整 GPX 路線；計算完成後依「沿騎乘方向的實際順逆風分量」分段上色，不畫風向箭頭。
       休息點可用「里程」或「地圖點選」加入；地圖點選會自動吸附到最近路線。
       同一路線的休息點會自動儲存在此瀏覽器，重新開啟或切回路線會帶回；清除瀏覽器資料或換裝置不會同步。清除休息點只影響目前路線。<br>
-      可讀取 GPX 的 wpt／rtept 或 KML 的 Point 補給點，以新增區的分鐘數匯入，再於下方逐站修改；僅有軌跡的檔案無法自動辨識休息站。<br>
+      可讀取 GPX 的 wpt／rtept 或 KML 的 Point 補給點，全部以 0 分鐘匯入（不停留），再於下方修改實際要停的站；僅有軌跡的檔案無法自動辨識休息站。<br>
       休息時間會加入後續 ETA，因此後半段 WRF 預報時間也會跟著延後。
     </div>
     <div id="restList" class="rest-list"></div>
@@ -409,13 +409,13 @@
     saveRestPlan();activePlanKey=key;
     const saved=key?readPlans()[key]?.points:[];
     const end=routeGeometry.at(-1)?.km||0;
-    restPoints=Array.isArray(saved)?saved.filter(r=>Number.isFinite(r.km)&&r.km>0&&r.km<end&&Number.isFinite(r.minutes)&&r.minutes>=1&&r.minutes<=360&&Number.isFinite(r.lat)&&Number.isFinite(r.lon)).slice(0,30):[];
+    restPoints=Array.isArray(saved)?saved.filter(r=>Number.isFinite(r.km)&&r.km>0&&r.km<end&&Number.isFinite(r.minutes)&&r.minutes>=0&&r.minutes<=360&&Number.isFinite(r.lat)&&Number.isFinite(r.lon)).slice(0,300):[];
     resetPlanningForRoute(restPoints.length?`已帶回這條路線的 ${restPoints.length} 個休息點，可直接修改分鐘數。`:'這條路線尚未設定休息點；加入後會自動記住。');
   }
 
   function editRestMinutes(id,value){
     const minutes=Number(value);
-    if(!Number.isInteger(minutes)||minutes<1||minutes>360){setRestStatus('休息時間需為 1–360 的整數分鐘。',true);renderRestList();return;}
+    if(!Number.isInteger(minutes)||minutes<0||minutes>360){setRestStatus('休息時間需為 0–360 的整數分鐘。',true);renderRestList();return;}
     const point=restPoints.find(r=>String(r.id)===String(id));
     if(!point) return;
     point.minutes=minutes;saveRestPlan();invalidateForecast('休息時間已儲存，請重新計算預報。');renderRestList();drawRouteMap();
@@ -543,7 +543,7 @@
   }
 
   function restPayload(){
-    return restPoints.map(r=>({
+    return restPoints.filter(r=>r.minutes>0).map(r=>({
       km:Number(r.km.toFixed(3)),minutes:Number(r.minutes),name:r.name,
       lat:Number(r.lat.toFixed(6)),lon:Number(r.lon.toFixed(6))
     }));
@@ -564,13 +564,13 @@
     km=Number(km);
     const minutes=Math.round(Number($('restMinutes').value));
     if(!Number.isFinite(km)) return setRestStatus('休息點里程無效。',true);
-    if(!(minutes>=1&&minutes<=360)) return setRestStatus('休息時間需為 1–360 分鐘。',true);
+    if(!(minutes>=0&&minutes<=360)) return setRestStatus('休息時間需為 0–360 分鐘。',true);
     const d=activeDistance();
     if(Number.isFinite(d)&&(km<=0||km>=d)) return setRestStatus(`休息點需位於 0–${d.toFixed(1)} km 之間。`,true);
     const p=(Number.isFinite(lat)&&Number.isFinite(lon))?{lat,lon}:pointAtRouteKm(km);
     if(!p) return setRestStatus('目前尚未載入路線幾何，無法加入休息點。',true);
 
-    if(restPoints.length>=30) return setRestStatus('最多可設定 30 個休息點。',true);
+    if(restPoints.length>=300) return setRestStatus('最多可保留 300 個補給點。',true);
     const customName=$('restName').value.trim();
     const name=customName||`休息點 ${restPoints.length+1}`;
     restPoints.push({id:Date.now()+Math.random(),km,minutes,name,lat:p.lat,lon:p.lon});
@@ -607,7 +607,7 @@
     el.innerHTML=restPoints.map(r=>{
       const t=timedRestFor(r),inside=r.km>bounds.start&&r.km<bounds.end;
       const timing=t?` · 抵達 ${fmtTime(t.arrival_taipei)} → ${fmtTime(t.departure_taipei)}`:'';
-      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · <label style="display:inline">休息 <input aria-label="${escapeHtml(r.name)}休息分鐘" data-rest-minutes="${r.id}" type="number" min="1" max="360" step="1" value="${r.minutes}" style="width:78px;display:inline-block"> 分</label></div><div class="rest-sub">${inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
+      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · <label style="display:inline">休息 <input aria-label="${escapeHtml(r.name)}休息分鐘" data-rest-minutes="${r.id}" type="number" min="0" max="360" step="1" value="${r.minutes}" style="width:78px;display:inline-block"> 分</label></div><div class="rest-sub">${r.minutes===0?'不停留，不增加 ETA':inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
     }).join('');
     el.querySelectorAll('[data-rest-minutes]').forEach(input=>input.addEventListener('change',()=>editRestMinutes(input.dataset.restMinutes,input.value)));
     el.querySelectorAll('[data-rest-remove]').forEach(btn=>btn.addEventListener('click',()=>removeRestPoint(btn.dataset.restRemove)));
@@ -886,7 +886,7 @@
       $('currentDistance').textContent=`${currentDistanceKm.toFixed(2)} km`;
       $('currentSource').textContent=d.source || 'GitHub current.gpx';
       if(d.source) currentRouteSource=d.source;
-      if(routeMode==='current'){setRouteGeometry(currentGeometry,true);updateRouteUI()}
+      if(routeMode==='current'){setRouteGeometry(currentGeometry,true);updateRouteUI();if(activePlanKey&&!readPlans()[activePlanKey]) await readRouteStops();}
       updateForecastWindow();
     }catch(e){
       $('currentDistance').textContent='讀取失敗';
@@ -944,17 +944,15 @@
     }
     if(!stops.length) throw new Error('檔案沒有補給點標記（GPX wpt／rtept 或 KML Point）；請先用里程或地圖加入，之後會自動記住。');
     if(stops.length>300) throw new Error('檔案有超過 300 個標記，可能是軌跡節點；請提供只含補給點的 GPX／KML。');
-    const minutes=Number($('restMinutes').value);
-    if(!Number.isInteger(minutes)||minutes<1||minutes>360) throw new Error('請先設定 1–360 的整數休息分鐘。');
     let added=0,skipped=0;
     for(const stop of stops){
       if(!Number.isFinite(stop.lat)||!Number.isFinite(stop.lon)||Math.abs(stop.lat)>90||Math.abs(stop.lon)>180){skipped++;continue;}
       const snap=nearestOnRoute(stop.lat,stop.lon);
-      if(!snap||snap.distanceKm>1||snap.km<=0||snap.km>=routeGeometry.at(-1).km||restPoints.some(r=>Math.abs(r.km-snap.km)<.05)||restPoints.length>=30){skipped++;continue;}
-      restPoints.push({id:Date.now()+Math.random(),name:stop.name,km:snap.km,minutes,lat:snap.lat,lon:snap.lon});added++;
+      if(!snap||snap.distanceKm>1||snap.km<=0||snap.km>=routeGeometry.at(-1).km||restPoints.some(r=>Math.abs(r.km-snap.km)<.05)||restPoints.length>=300){skipped++;continue;}
+      restPoints.push({id:Date.now()+Math.random(),name:stop.name,km:snap.km,minutes:0,lat:snap.lat,lon:snap.lon});added++;
     }
     restPoints.sort((a,b)=>a.km-b.km);saveRestPlan();
-    invalidateForecast(`已匯入 ${added} 個補給點，各 ${minutes} 分；略過 ${skipped} 個（重複、離路線超過 1 km、起終點或超過 30 點）。可在下方逐站修改時間。`);
+    invalidateForecast(`已加入 ${added} 個補給點，預設 0 分鐘（不停留）；略過 ${skipped} 個重複、離路線超過 1 km 或起終點標記。已設定的時間會保留。`);
     renderRestList();drawRouteMap();
   }
 
@@ -1001,6 +999,7 @@
       $('clearUploadBtn').disabled=false;
       setRouteGeometry(temporaryGeometry,true);
       updateRouteUI();
+      if(activePlanKey&&!readPlans()[activePlanKey]) await readRouteStops();
 
       updateForecastWindow();
       setStatus('臨時 GPX 已載入。按「計算預報」時才會上傳給 Render；不會覆蓋 current.gpx。');
@@ -1059,6 +1058,7 @@
   }
 
   function validateSettings(){
+    if(restPoints.filter(r=>r.minutes>0).length>30) throw new Error("實際停留（大於 0 分鐘）的站點最多 30 個，其餘請設為 0 分鐘。");
     const speed=Number($('speed').value);
     const step=Number($('step').value);
     if(!(speed>=5&&speed<=60)) throw new Error('平均移動速度需在 5–60 km/h');
