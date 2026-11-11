@@ -24,7 +24,7 @@ from eccodes import (
     codes_write,
 )
 
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 MODEL_NAME = "CWA WRF-3KM"
 MAX_FH = 84
 STEP_H = 6
@@ -44,7 +44,7 @@ MAX_CACHE_MB = int(os.getenv("MAX_CACHE_MB", "450"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
 UV_CACHE_TTL = int(os.getenv("UV_CACHE_TTL_SECONDS", "1200"))
 KEEP_FULL_GRIB = os.getenv("KEEP_FULL_GRIB", "false").strip().lower() in {"1","true","yes","on"}
-UV_CACHE_DIR = CACHE_DIR / "uv10_t2_v1"
+UV_CACHE_DIR = CACHE_DIR / "uv10_t2_rain_v2"
 UV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # V0.2.3: cache route-coordinate -> WRF grid indices + IDW weights.
@@ -368,12 +368,12 @@ def build_uv10_cache(fh: int, force: bool = False):
                                 "forecastTime": int(safe_get(gid, "forecastTime", fh) or fh),
                             }
 
-                        comp = classify_uv_message(gid) or ("t2" if is_temperature_message(gid) else None)
+                        comp = classify_uv_message(gid) or ("t2" if is_temperature_message(gid) else "rain" if is_precipitation_message(gid) else None)
                         if comp and comp not in found:
                             codes_write(gid, out)
                             found.add(comp)
 
-                        if {"u", "v", "t2"}.issubset(found):
+                        if {"u", "v", "t2", "rain"}.issubset(found):
                             break
                     finally:
                         codes_release(gid)
@@ -401,6 +401,7 @@ def build_uv10_cache(fh: int, force: bool = False):
                 raise RuntimeError("No GRIB metadata found while extracting U/V")
 
             meta["temperature_available"] = "t2" in found
+            meta["precipitation_available"] = "rain" in found
             meta["init_epoch"] = init_epoch(meta)
             meta["forecast_hour"] = fh
             meta["created_at_epoch"] = int(time.time())
@@ -734,6 +735,81 @@ def read_temperature_many(path, coords, expected_init, gridmap=None):
                 return [temperature_celsius(float(v), units) for v in vals]
             finally:
                 codes_release(gid)
+
+
+def is_precipitation_message(gid):
+    # CWA currently encodes this WMO parameter with shortName/units="unknown".
+    return (tuple(safe_get(gid, k, -1) for k in
+                  ("discipline", "parameterCategory", "parameterNumber")) == (0, 1, 8)
+            and safe_get(gid, "typeOfLevel", "") == "surface"
+            and safe_get(gid, "stepType", "") == "accum")
+
+
+def read_precipitation_many(path, coords, expected_init, fh, gridmap=None):
+    with open(path, "rb") as f:
+        while (gid := codes_grib_new_from_file(f)) is not None:
+            try:
+                if not is_precipitation_message(gid):
+                    continue
+                meta = {k: codes_get(gid, k) for k in ("dataDate", "dataTime")}
+                start, end = float(codes_get(gid, "startStep")), float(codes_get(gid, "endStep"))
+                if (init_epoch(meta) != expected_init or safe_get(gid, "stepUnits", None) != 1
+                        or end != fh or not 0 <= start <= end):
+                    return None
+                units = str(safe_get(gid, "units", "unknown"))
+                if units not in {"unknown", "kg m**-2", "kg m-2", "kg m^-2", "mm", "m"}:
+                    return None
+                factor = 1000 if units == "m" else 1
+                missing = safe_get(gid, "missingValue", 9999)
+                def clean(v):
+                    v = float(v)
+                    return v * factor if math.isfinite(v) and v != missing and 0 <= v * factor < 10000 else math.nan
+                if gridmap and grid_fingerprint(gid) == gridmap["fingerprint"]:
+                    vals, _ = apply_grid_mappings([clean(v) for v in codes_get_array(gid, "values")], gridmap)
+                else:
+                    vals, points = idw4_many(gid, coords)
+                    vals = [clean(v) if all(math.isfinite(clean(p["value"])) for p in pts) else math.nan
+                            for v, pts in zip(vals, points)]
+                return {"init": expected_init, "start_hour": start, "end_hour": end,
+                        "values_mm": [float(v) if math.isfinite(v) else None for v in vals]}
+            finally:
+                codes_release(gid)
+    return None
+
+
+def precipitation_window(forecast_hour):
+    if not 0 <= forecast_hour <= MAX_FH:
+        return None
+    end = max(STEP_H, int(math.ceil(forecast_hour / STEP_H)) * STEP_H)
+    return end - STEP_H, end
+
+
+def precipitation_at(fields, forecast_hour, index, init):
+    window = precipitation_window(forecast_hour)
+    result = {"precipitation_mm": None, "precipitation_start_taipei": None,
+              "precipitation_end_taipei": None, "precipitation_hours": STEP_H}
+    if window is None:
+        return result
+    start, end = window
+    result.update(precipitation_start_taipei=iso_taipei(init + start * 3600),
+                  precipitation_end_taipei=iso_taipei(init + end * 3600))
+    def field(h):
+        r = fields.get(h, {}).get("precipitation")
+        return r if r and r["init"] == init and r["end_hour"] == h else None
+    high = field(end)
+    if not high or index >= len(high["values_mm"]):
+        return result
+    value = high["values_mm"][index]
+    if high["start_hour"] != start:
+        low = field(start)
+        if (not low or high["start_hour"] != low["start_hour"]
+                or high["start_hour"] > start or index >= len(low["values_mm"])):
+            return result
+        baseline = low["values_mm"][index]
+        value = value - baseline if value is not None and baseline is not None else None
+    if value is not None and math.isfinite(value) and value >= -0.001:
+        result["precipitation_mm"] = round(max(0, value), 2)
+    return result
 
 
 def interpolate_temperature(fields, used_hours, alpha, index):
@@ -1455,7 +1531,14 @@ def load_uv_many_for_cycle(fh: int, coords, expected_init: int, gridmap=None):
         diag(f"[TEMPERATURE] unavailable fh={fh:03d}: {e}")
         temperatures = [None] * len(coords)
 
+    try:
+        precipitation = read_precipitation_many(uv_path, coords, expected_init, fh, gridmap)
+    except Exception as e:
+        diag(f"[RAIN] unavailable fh={fh:03d}: {e}")
+        precipitation = None
+
     return {
+        "precipitation": precipitation,
         "fh": fh,
         "init": got_init,
         "u": u,
@@ -2013,6 +2096,7 @@ def _calculate_route_forecast(
     if not kms or abs(kms[-1] - final_km) > 1e-6:
         kms.append(final_km)
 
+    kms = sorted(set(kms + [r["km"] for r in active_rests]))
     route_samples = [route_point_at_km(route, k) for k in kms]
     diag(
         f"[ROUTE_FORECAST] route ready samples={len(route_samples)} "
@@ -2122,6 +2206,20 @@ def _calculate_route_forecast(
             f"elapsed={time.time()-fh_t0:.1f}s"
         )
 
+    # Rain-only hours are optional: never prevent a valid wind forecast.
+    rain_hours = set()
+    for sample in route_samples:
+        window = precipitation_window((sample["eta_epoch"] - init) / 3600)
+        if window:
+            rain_hours.update(h for h in window if h > 0)
+    for fh in sorted(rain_hours - fields.keys()):
+        try:
+            path, _ = build_uv10_cache(fh)
+            rain = read_precipitation_many(path, coords, init, fh, gridmap)
+            fields[fh] = {"precipitation": rain}
+        except Exception as e:
+            diag(f"[RAIN] optional fh={fh:03d} unavailable: {e}")
+
     output = []
     degraded_count = 0
     unavailable_count = 0
@@ -2214,6 +2312,7 @@ def _calculate_route_forecast(
             "degraded": degraded,
             "fallback_reason": fallback_reason,
             "temperature_c": interpolate_temperature(fields, used, alpha, i),
+            **precipitation_at(fields, rf, i, init),
             "wind_speed_mps": round(ws, 3),
             "wind_direction_deg": round(wd, 1),
             "wind_direction_text": dir_text(wd),
@@ -2248,7 +2347,14 @@ def _calculate_route_forecast(
         point = fn(temperatures, key=lambda x: x["temperature_c"], default=None)
         return {k: point[k] for k in ("temperature_c", "km", "eta_taipei")} if point else None
 
+    for rest in timed_rests:
+        point = next((x for x in output if abs(x["km"] - rest["km"]) < 0.001), {})
+        rest.update({k: v for k, v in point.items() if k.startswith("precipitation_")})
+    rains = [x["precipitation_mm"] for x in available if x.get("precipitation_mm") is not None]
+
     summary = {
+        "precipitation_samples_available": len(rains),
+        "max_period_precipitation_mm": max(rains, default=None),
         "min_temperature": temperature_extreme(min),
         "max_temperature": temperature_extreme(max),
         "temperature_samples_available": len(temperatures),

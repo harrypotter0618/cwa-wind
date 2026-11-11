@@ -156,7 +156,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.5</div>
+    <div class="version">UI V0.4.6</div>
   </header>
 
   <section class="panel">
@@ -291,9 +291,11 @@
       <span><i class="dot" style="background:#f59e0b"></i>輕微逆風</span>
       <span><i class="dot" style="background:#ef4444"></i>明顯逆風</span>
       <span><i class="dot" style="background:#facc15"></i>休息點</span>
+      <span><i class="dot" style="background:#60a5fa"></i>預報時段雨量 ≥ 0.1 mm</span>
     </div>
 
     <div class="map-hint">
+      雨量為抵達時間所屬的 6 小時累積預報，非降雨機率或當下雨勢；6 小時分界採該時刻結束的時段，起報時刻採後續第一時段。缺資料顯示 —；0 mm 不保證全程無雨。<br>
       預報前先顯示完整 GPX 路線；計算完成後依「沿騎乘方向的實際順逆風分量」分段上色，不畫風向箭頭。
       休息點可用「里程」或「地圖點選」加入；地圖點選會自動吸附到最近路線。
       同一路線的休息點會自動儲存在此瀏覽器，重新開啟或切回路線會帶回；清除瀏覽器資料或換裝置不會同步。清除休息點只影響目前路線。<br>
@@ -347,7 +349,7 @@
           <thead>
             <tr>
               <th>里程</th><th>ETA</th><th>累計休息</th><th>模式提前量</th><th>騎乘方向</th>
-              <th>預報氣溫 °C</th><th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
+              <th>預報氣溫 °C</th><th>時段雨量 mm／6 h</th><th>風向（FROM）</th><th>風速</th><th>順風</th><th>逆風</th>
               <th>側風</th><th>沿線效益</th><th>相對角</th><th>方向分類</th><th>騎乘感受</th><th>取樣格距</th>
             </tr>
           </thead>
@@ -607,7 +609,7 @@
     el.innerHTML=restPoints.map(r=>{
       const t=timedRestFor(r),inside=r.km>bounds.start&&r.km<bounds.end;
       const timing=t?` · 抵達 ${fmtTime(t.arrival_taipei)} → ${fmtTime(t.departure_taipei)}`:'';
-      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · <label style="display:inline">休息 <input aria-label="${escapeHtml(r.name)}休息分鐘" data-rest-minutes="${r.id}" type="number" min="0" max="360" step="1" value="${r.minutes}" style="width:78px;display:inline-block"> 分</label></div><div class="rest-sub">${r.minutes===0?'不停留，不增加 ETA':inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
+      return `<div class="rest-item"><div><div class="rest-main"><strong>${escapeHtml(r.name)}</strong> · KM ${r.km.toFixed(1)} · <label style="display:inline">休息 <input aria-label="${escapeHtml(r.name)}休息分鐘" data-rest-minutes="${r.id}" type="number" min="0" max="360" step="1" value="${r.minutes}" style="width:78px;display:inline-block"> 分</label></div><div class="rest-sub">${r.minutes===0?'不停留，不增加 ETA':inside?'納入目前預報區段':'目前區段外，不計入 ETA'}${timing}${t?`<br>抵達時段雨量 ${formatRain(t)}`:''}</div></div><button class="danger" data-rest-remove="${r.id}">刪除</button></div>`;
     }).join('');
     el.querySelectorAll('[data-rest-minutes]').forEach(input=>input.addEventListener('change',()=>editRestMinutes(input.dataset.restMinutes,input.value)));
     el.querySelectorAll('[data-rest-remove]').forEach(btn=>btn.addEventListener('click',()=>removeRestPoint(btn.dataset.restRemove)));
@@ -620,7 +622,7 @@
     for(const r of restPoints){
       const t=timedRestFor(r),timing=t?`<br>抵達 ${fmtTime(t.arrival_taipei)}<br>離開 ${fmtTime(t.departure_taipei)}`:'';
       L.circleMarker([r.lat,r.lon],{radius:7,color:'#713f12',weight:2,fillColor:'#facc15',fillOpacity:1})
-        .bindPopup(`<strong>${escapeHtml(r.name)}</strong><br>KM ${r.km.toFixed(1)}<br>休息 ${r.minutes} 分${timing}`)
+        .bindPopup(`<strong>${escapeHtml(r.name)}</strong><br>KM ${r.km.toFixed(1)}<br>休息 ${r.minutes} 分${timing}${t?`<br>抵達時段雨量 ${formatRain(t)}`:''}`)
         .addTo(restMarkerLayer);
     }
   }
@@ -638,8 +640,15 @@
         const pts=geometryBetween(a.km,b.km);
         if(pts.length<2) continue;
         L.polyline(pts,{color:effectColorSample(a),weight:7,opacity:.95})
-          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(effectDisplay(a))}<br>總風速 ${a.wind_speed_mps.toFixed(1)} m/s · 沿線 ${alongEffectValue(a)>=0?'+':''}${alongEffectValue(a).toFixed(2)} m/s<br>預報氣溫 ${formatTemperature(a.temperature_c)}<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
+          .bindPopup(`<strong>KM ${a.km}–${b.km}</strong><br>${escapeHtml(effectDisplay(a))}<br>總風速 ${a.wind_speed_mps.toFixed(1)} m/s · 沿線 ${alongEffectValue(a)>=0?'+':''}${alongEffectValue(a).toFixed(2)} m/s<br>預報氣溫 ${formatTemperature(a.temperature_c)}<br>時段雨量 ${formatRain(a)}<br>ETA ${fmtTime(a.eta_taipei)} · 風向 ${escapeHtml(a.wind_direction_text)}`)
           .addTo(windRouteLayer);
+      }
+      for(const point of samples){
+        if(typeof point.precipitation_mm==='number'&&point.precipitation_mm>=0.1){
+          L.circleMarker([point.lat,point.lon],{radius:5,color:'#1d4ed8',weight:2,fillColor:'#60a5fa',fillOpacity:.9})
+            .bindPopup(`<strong>KM ${point.km} · 預報有雨取樣點</strong><br>ETA ${fmtTime(point.eta_taipei)}<br>${formatRain(point)}<br>時段累積量，非抵達當下雨勢`)
+            .addTo(windRouteLayer);
+        }
       }
     }
     renderRestMarkers();
@@ -1233,6 +1242,14 @@
     });
   }
 
+  function formatRain(point){
+    const value=point?.precipitation_mm;
+    const amount=typeof value==='number'&&Number.isFinite(value)?value.toFixed(2)+' mm':'—（雨量缺資料）';
+    const period=point?.precipitation_start_taipei&&point?.precipitation_end_taipei
+      ?`${fmtDateTime(point.precipitation_start_taipei)}–${fmtDateTime(point.precipitation_end_taipei)}`:'';
+    return `${amount}${period?`<br><small>${period} · 6 小時</small>`:''}`;
+  }
+
   function formatTemperature(value){
     return typeof value === "number" && Number.isFinite(value) ? value.toFixed(1)+" °C" : "—";
   }
@@ -1261,7 +1278,8 @@
       ['最大順風',maxTail,s.max_tailwind?`${s.max_tailwind.wind_direction_text} · ${fmtTime(s.max_tailwind.eta_taipei)}`:'—'],
       ['最大逆風',maxHead,s.max_headwind?`${s.max_headwind.wind_direction_text} · ${fmtTime(s.max_headwind.eta_taipei)}`:'—'],
       ...['min_temperature','max_temperature'].map((key,i)=>[i?'沿途預報最高溫':'沿途預報最低溫',formatTemperature(s[key]?.temperature_c),s[key]?`KM${s[key].km} · ${fmtTime(s[key].eta_taipei)} · 有效氣溫 ${s.temperature_samples_available}/${s.samples_total}`:'氣溫資料尚未提供']),
-      ['模式精細度','約 3 km 網格','原始時間輸出 6 h；ETA 間插值'],
+      ['最大時段雨量',typeof s.max_period_precipitation_mm==='number'?s.max_period_precipitation_mm.toFixed(2)+' mm／6 h':'—',`有效雨量 ${s.precipitation_samples_available??0}/${s.samples_total??0}；非全程累計`],
+      ['模式精細度','約 3 km 網格','風溫依 ETA 插值；雨量為所屬 6 h 時段'],
       ['後端',`API ${data.version||'—'}`,data.model||'WRF-3KM']
     ];
     $('summary').innerHTML=cards.map(([k,v,sub])=>`<div class="card"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join('');
@@ -1297,7 +1315,7 @@
 
       if(!x.available){
         return `<tr>${baseStart}
-          <td colspan="11"><span class="badge b-near">暫無可用模式資料</span> ${escapeHtml(x.reason||'UNAVAILABLE')}</td>
+          <td colspan="12"><span class="badge b-near">暫無可用模式資料</span> ${escapeHtml(x.reason||'UNAVAILABLE')}</td>
         </tr>`;
       }
 
@@ -1305,7 +1323,7 @@
       const along=alongEffectValue(x);
       return `<tr>
         ${baseStart}
-        <td>${formatTemperature(x.temperature_c)}</td>
+        <td>${formatTemperature(x.temperature_c)}</td><td>${formatRain(x)}</td>
         <td><span class="arrow" style="transform:rotate(${flowTo}deg)">↑</span> ${x.wind_direction_text} ${Number(x.wind_direction_deg).toFixed(1)}°</td>
         <td>${Number(x.wind_speed_mps).toFixed(2)}</td>
         <td>${Number(x.tailwind_mps).toFixed(2)}</td>
@@ -1423,7 +1441,7 @@
     if(!lastData)return;
     const rows=[[
       'km','eta_taipei','rest_delay_minutes','available','reason',
-      'temperature_c','heading_deg','wind_direction_deg','wind_speed_mps',
+      'temperature_c','precipitation_mm','precipitation_start_taipei','precipitation_end_taipei','precipitation_hours','heading_deg','wind_direction_deg','wind_speed_mps',
       'tailwind_mps','headwind_mps','crosswind_mps',
       'along_effect_mps','relative_wind_angle_deg',
       'wind_effect','wind_effect_detail','along_effect_strength','near_calm',
@@ -1431,7 +1449,7 @@
     ]];
     (lastData.samples||[]).forEach(s=>rows.push([
       s.km,s.eta_taipei,s.rest_delay_minutes,s.available,s.reason,
-      s.temperature_c,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
+      s.temperature_c,s.precipitation_mm,s.precipitation_start_taipei,s.precipitation_end_taipei,s.precipitation_hours,s.heading_deg,s.wind_direction_deg,s.wind_speed_mps,
       s.tailwind_mps,s.headwind_mps,s.crosswind_mps,
       s.along_effect_mps,s.relative_wind_angle_deg,
       s.wind_effect,s.wind_effect_detail,s.along_effect_strength,s.near_calm,
