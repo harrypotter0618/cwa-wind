@@ -146,6 +146,34 @@
       .rest-grid{grid-template-columns:1fr}
       #forecastMap{height:420px}
     }
+
+    @page{size:A4 landscape;margin:10mm}
+    @media print{
+      *{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}
+      body{background:white!important;color:#111!important}
+      .wrap{max-width:none!important;width:100%!important;padding:0!important}
+      .wrap>section:first-of-type,.rest-grid,.map-actions,.map-hint,#restStatus,#apiState,.tooltip,.leaflet-control-zoom,.rest-item button{display:none!important}
+      header{margin:0 0 8px!important}header .subtitle{display:none}
+      .panel{break-inside:auto;border:1px solid #aaa;margin:0 0 10px;padding:10px;background:white!important;box-shadow:none!important;color:#111!important}
+      .card,.rest-item,table,th,td{background:white!important;color:#111!important}
+      .card .k,.card .s,.note,.legend,.footer-note{color:#444!important}
+      .badge{color:#111!important}
+      .chart-box{background:#0f172a!important;color:#e5e7eb!important}
+      #mapPanel,.chart-box,.card,.rest-item{break-inside:avoid;page-break-inside:avoid}
+      #forecastMap{height:520px!important}
+      #restList{display:none}
+      .summary-grid{grid-template-columns:repeat(4,1fr)!important}
+      .charts{display:block}.chart-box{margin-bottom:10px}
+      canvas{height:auto!important;max-height:250px;object-fit:contain}
+      .table-wrap{overflow:visible!important}
+      table{min-width:0!important;width:100%!important;table-layout:fixed}
+      th,td{font-size:7pt!important;padding:3px!important;white-space:normal!important;overflow-wrap:anywhere}
+      th{position:static!important}thead{display:table-header-group}
+      tr{break-inside:avoid;page-break-inside:avoid}
+      h2{break-after:avoid}
+      .print-rests{display:block!important}
+    }
+    .print-rests{display:none}
   </style>
 </head>
 <body>
@@ -156,7 +184,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.6</div>
+    <div class="version">UI V0.4.7</div>
   </header>
 
   <section class="panel">
@@ -246,7 +274,10 @@
       <button id="runBtn" class="primary">計算預報</button>
       <button id="nowBtn" class="secondary">出發時間設為現在</button>
       <button id="csvBtn" class="secondary" disabled>下載 CSV</button>
+      <button id="pdfBtn" class="secondary" disabled>整頁 PDF（不分頁）</button>
+      <button id="printBtn" class="secondary" disabled>紙張列印／PDF</button>
     </div>
+    <div class="note">整頁 PDF：完整長頁、可放大閱讀；紙張列印：A4 橫式分頁，圖表與表格列不截斷。輸出目前已計算結果。</div>
     <div id="status" class="status"></div>
     <div class="note">
       「全程」模式不傳 end_km，後端會自動用目前 GPX 的真實總長，因此換路線不需要手動改 352 km。
@@ -255,7 +286,7 @@
   </section>
 
 
-  <section class="panel">
+  <section class="panel" id="mapPanel">
     <h2>路線風況地圖＋休息點規劃</h2>
     <div class="rest-grid">
       <div>
@@ -305,6 +336,7 @@
     <div id="restList" class="rest-list"></div>
   </section>
 
+  <div id="printRests" class="print-rests panel"></div>
   <section id="results" class="hidden">
     <section class="panel">
       <h2>摘要</h2>
@@ -477,7 +509,7 @@
   function resetPlanningForRoute(message='已切換路線，套用此路線的休息點。'){
     lastData=null;
     $('results').classList.add('hidden');
-    $('csvBtn').disabled=true;
+    $('csvBtn').disabled=true;$('pdfBtn').disabled=true;$('printBtn').disabled=true;
     renderRestList();
     drawRouteMap();
     updateForecastWindow();
@@ -555,7 +587,7 @@
     if(lastData){
       lastData=null;
       $('results').classList.add('hidden');
-      $('csvBtn').disabled=true;
+      $('csvBtn').disabled=true;$('pdfBtn').disabled=true;$('printBtn').disabled=true;
       drawRouteMap();
     }
     setRestStatus(message);
@@ -1108,7 +1140,7 @@
     try{validateSettings()}catch(e){setStatus(e.message,true);return}
 
     $('runBtn').disabled=true;
-    $('csvBtn').disabled=true;
+    $('csvBtn').disabled=true;$('pdfBtn').disabled=true;$('printBtn').disabled=true;
     const isUpload=routeMode==='upload';
     setStatus(isUpload
       ? `正在上傳 ${temporaryFile.name} 並計算 WRF3KM…`
@@ -1160,7 +1192,7 @@
       const cycleNote=fallbackH>0?`；已自動退回上一輪 ${fallbackH} 小時的完整 cycle`:'';
       const rolloutNote=(un>0||dg>0)?`；降級 ${dg}、暫不可用 ${un}`:'';
       setStatus(`完成：${av}/${total} 個取樣點可用${cycleNote}${rolloutNote}；等待 ${sec.toFixed(1)} 秒。路線來源：${data.route?.route_id==='temporary_upload'?'臨時 GPX':'current.gpx'}`);
-      $('csvBtn').disabled=false;
+      $('csvBtn').disabled=false;$('pdfBtn').disabled=false;$('printBtn').disabled=false;
     }catch(e){
       const msg=e.name==='AbortError'
         ?'逾時：等待 API 超過 6 分鐘。請查看 Render Log 是否在冷啟動或下載新模式資料。'
@@ -1437,6 +1469,67 @@
     c.addEventListener('mouseleave',()=>tip.style.display='none')
   }
 
+  function preparePrintRests(){
+    if(!lastData)return;
+    const rests=lastData.ride?.rest_points||[];
+    $('printRests').innerHTML='<h2>本次計算的休息點</h2>'+ (rests.length?rests.map(r=>
+      `<div class="rest-item"><div>${escapeHtml(r.name||'休息點')} · KM ${r.km} · ${r.minutes} 分鐘 · 抵達 ${fmtDateTime(r.arrival_taipei)} → 離開 ${fmtDateTime(r.departure_taipei)}<br>時段雨量 ${formatRain(r)}</div></div>`).join(''):'未安排停留');
+  }
+
+  const exportLibraries={};
+  function loadExportLibrary(url){
+    if(!exportLibraries[url])exportLibraries[url]=new Promise((resolve,reject)=>{
+      const script=document.createElement('script');script.src=url;script.crossOrigin='anonymous';
+      script.onload=resolve;script.onerror=()=>{delete exportLibraries[url];script.remove();reject(new Error('PDF 元件下載失敗，請確認網路後重試。'));};
+      document.head.appendChild(script);
+    });
+    return exportLibraries[url];
+  }
+
+  async function exportWholePDF(){
+    if(!lastData)return;
+    const btn=$('pdfBtn');btn.disabled=true;btn.textContent='正在製作整頁 PDF…';
+    const snapshot=lastData;
+    try{
+      await Promise.all([
+        loadExportLibrary('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'),
+        loadExportLibrary('https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js')
+      ]);
+      if(lastData!==snapshot)throw new Error('預報結果已變更，請重新匯出。');
+      preparePrintRests();
+      if(document.fonts?.ready)await document.fonts.ready;
+      const root=document.querySelector('.wrap');
+      const width=Math.ceil(Math.max(1500,$('tbody').closest('table').scrollWidth+100));
+      const canvas=await html2canvas(root,{
+        backgroundColor:'#0b1220',scale:Math.min(1.5,Math.sqrt(24000000/(width*Math.max(root.scrollHeight,1)))),useCORS:true,allowTaint:false,
+        windowWidth:width,scrollX:0,scrollY:0,imageTimeout:20000,logging:false,
+        onclone:doc=>{
+          const wrap=doc.querySelector('.wrap');
+          wrap.style.cssText=`width:${width}px;max-width:none;padding:24px;margin:0;`;
+          doc.querySelectorAll('.wrap>section:first-of-type,.rest-grid,.map-actions,.map-hint,#restStatus,#restList,#apiState,.tooltip,.leaflet-control-zoom').forEach(el=>el.style.display='none');
+          doc.querySelectorAll('.table-wrap').forEach(el=>el.style.overflow='visible');
+          doc.querySelectorAll('th').forEach(el=>el.style.position='static');
+          doc.getElementById('printRests').style.display='block';
+          doc.querySelectorAll('.summary-grid').forEach(el=>el.style.gridTemplateColumns='repeat(4,1fr)');
+          // Keep Leaflet's existing viewport/tiles aligned rather than resizing the map.
+          const original=document.getElementById('forecastMap');
+          doc.getElementById('forecastMap').style.width=original.clientWidth+'px';
+        }
+      });
+      if(!canvas.width||!canvas.height||canvas.height>32760)throw new Error('結果過長，請增加取樣間距後匯出，或使用紙張列印。');
+      const {jsPDF}=window.jspdf;
+      // Custom page preserves the complete report; stay below PDF's 14,400 pt limit.
+      const factor=Math.min(0.75,14000/Math.max(canvas.width,canvas.height));
+      const pw=canvas.width*factor,ph=canvas.height*factor;
+      const pdf=new jsPDF({orientation:ph>=pw?'portrait':'landscape',unit:'pt',format:[pw,ph],compress:true});
+      pdf.addImage(canvas.toDataURL('image/png'),'PNG',0,0,pw,ph,undefined,'FAST');
+      pdf.save(`WRF3KM_整頁預報_${Date.now()}.pdf`);
+      canvas.width=canvas.height=0;
+      setStatus('整頁 PDF 已產生：單一長頁，可放大閱讀。若需實體列印，請使用「紙張列印／PDF」。');
+    }catch(e){setStatus('匯出失敗：'+e.message,true);}
+    finally{btn.textContent='整頁 PDF（不分頁）';btn.disabled=!lastData||$('csvBtn').disabled;}
+  }
+
   function downloadCSV(){
     if(!lastData)return;
     const rows=[[
@@ -1462,6 +1555,9 @@
   $('runBtn').addEventListener('click',runForecast);
   $('nowBtn').addEventListener('click',()=>{setNow();saveSettings();updateForecastWindow()});
   $('csvBtn').addEventListener('click',downloadCSV);
+  $('pdfBtn').addEventListener('click',exportWholePDF);
+  $('printBtn').addEventListener('click',()=>{preparePrintRests();window.print();});
+  window.addEventListener('beforeprint',preparePrintRests);
   $('useCurrentBtn').addEventListener('click',useCurrent);
   $('refreshRouteBtn').addEventListener('click',refreshCurrentRoute);
   $('clearUploadBtn').addEventListener('click',clearUpload);
