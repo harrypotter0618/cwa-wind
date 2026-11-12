@@ -164,7 +164,9 @@
       #restList{display:none}
       .summary-grid{grid-template-columns:repeat(4,1fr)!important}
       .charts{display:block}.chart-box{margin-bottom:10px}
-      canvas{height:auto!important;max-height:250px;object-fit:contain}
+      /* Leaflet canvas uses geographic pixel coordinates: never scale it independently of map tiles. */
+      .chart-box canvas{height:auto!important;max-height:250px;object-fit:contain}
+      #forecastMap canvas{max-height:none!important;max-width:none!important;object-fit:fill!important}
       .table-wrap{overflow:visible!important}
       table{min-width:0!important;width:100%!important;table-layout:fixed}
       th,td{font-size:7pt!important;padding:3px!important;white-space:normal!important;overflow-wrap:anywhere}
@@ -184,7 +186,7 @@
       <div class="subtitle">正式路線預設使用 current.gpx；也可臨時上傳 GPX 試算，不會覆蓋 current.gpx。 新模式發布期間不鎖死出發時間，並自動尋找能完整涵蓋整趟的單一 cycle。</div>
       <div id="apiState" class="api-state">API：檢查中…</div>
     </div>
-    <div class="version">UI V0.4.7</div>
+    <div class="version">UI V0.4.8</div>
   </header>
 
   <section class="panel">
