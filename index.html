@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>CWA 騎乘即時風雨 V0.6.2 地圖版</title>
+<title>CWA 騎乘即時風雨 V0.6.3 地圖版</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--text:#111;--muted:#666;--line:#e8e8e8}
 *{box-sizing:border-box}
@@ -39,7 +39,7 @@ button.primary{font-weight:800;font-size:18px}
 <div class="wrap">
 
 <div class="card">
-  <div class="big">CWA 騎乘即時風雨 V0.6.2 地圖版</div>
+  <div class="big">CWA 騎乘即時風雨 V0.6.3 地圖版</div>
   <div class="muted">GPX 路線優先｜CWA 即時風雨｜沿線測站地圖｜語音播報</div>
 </div>
 
@@ -71,6 +71,7 @@ button.primary{font-weight:800;font-size:18px}
   </div>
   <div class="row" style="margin-top:10px">
     <input id="gpxFile" type="file" accept=".gpx,application/gpx+xml,text/xml,application/xml">
+    <button id="defaultRouteBtn">載入預設北高路線</button>
     <button id="clearRouteBtn">清除路線</button>
   </div>
   <div id="routeStatus" class="muted" style="margin-top:6px">目前：無路線，使用 GPS heading</div>
@@ -356,13 +357,13 @@ function popupHtml(s,h){
 
 function renderMap(){
   initMap();
-  if(!map||!currentPos)return;
+  if(!map)return;
 
-  if(!userMarker){
+  if(currentPos && !userMarker){
     userMarker=L.circleMarker([currentPos.lat,currentPos.lon],{
       radius:8,weight:3,fillOpacity:.9
     }).addTo(map).bindTooltip('目前位置');
-  }else{
+  }else if(currentPos && userMarker){
     userMarker.setLatLng([currentPos.lat,currentPos.lon]);
   }
 
@@ -376,6 +377,10 @@ function renderMap(){
     }).addTo(map);
   }
 
+  if(!currentPos && routeLayer && !mapInitialFocused){
+    map.fitBounds(routeLayer.getBounds(),{padding:[28,28]});
+    mapInitialFocused=true;
+  }
   stationLayer.clearLayers();
   const onlyUsed=$('mapOnlyUsed')?.checked;
   const stations=allStations.filter(s=>!onlyUsed||isUsedStation(s));
@@ -401,7 +406,7 @@ function renderMap(){
       .bindPopup(popupHtml(s,h));
   }
 
-  if(!mapInitialFocused && !mapUserMoved){
+  if(currentPos && !mapInitialFocused && !mapUserMoved){
     setTimeout(()=>{
       focusMap(20);
       mapInitialFocused=true;
@@ -552,6 +557,7 @@ function maybeSpeakAfterUpdate(force=false){
 }
 
 function render(){
+  renderMap();
   if(!currentPos||!allStations.length)return;
   const h=currentHeading();
   for(const s of allStations)s.dist=hav(currentPos.lat,currentPos.lon,s.lat,s.lon);
@@ -711,24 +717,46 @@ $('startBtn').onclick=async()=>{if(tracking)return;tracking=true;try{await getGp
 $('stopBtn').onclick=()=>{tracking=false;clearInterval(gpsTimer);clearInterval(cwaTimer);$('status').textContent='追蹤已停止'}
 $('gpsInterval').onchange=()=>{if(tracking)scheduleGps()};$('cwaInterval').onchange=()=>{if(tracking)scheduleCwa()};$('crossLimit').onchange=render;
 
+let routeLoadId=0;
+function applyRoute(text,name){
+  const parsed=parseGPX(text);
+  if(parsed.length<2)throw Error('GPX 沒有有效路線點');
+  route=parsed;
+  buildRouteSamples();
+  mapInitialFocused=false; mapUserMoved=false;
+  analysisMode='route';
+  const here=locateOnRoute();
+  $('routeStatus').textContent='GPX 已啟用，路線方向優先｜'+name+'｜'+route.at(-1).cum.toFixed(1)+' km'+(here?'｜目前約 '+here.cum.toFixed(1)+' km':'');
+  render();
+}
+async function loadDefaultRoute(){
+  const id=++routeLoadId;
+  $('routeStatus').textContent='正在載入預設北高路線…';
+  try{
+    const response=await fetch('./ride-api/routes/current.gpx',{cache:'no-cache'});
+    if(!response.ok)throw Error('HTTP '+response.status);
+    const text=await response.text();
+    if(id!==routeLoadId)return;
+    applyRoute(text,'預設北高路線');
+  }catch(err){
+    if(id!==routeLoadId)return;
+    $('routeStatus').textContent='預設路線載入失敗：'+err.message+'；可按「載入預設北高路線」重試或手動選擇 GPX。';
+  }
+}
+$('defaultRouteBtn').onclick=loadDefaultRoute;
 $('gpxFile').onchange=async e=>{
   const f=e.target.files[0];if(!f)return;
+  const id=++routeLoadId;
   try{
-    route=parseGPX(await f.text());
-    if(route.length<2)throw Error('GPX 沒有有效路線點');
-    buildRouteSamples();
-    mapInitialFocused=false; mapUserMoved=false;
-    analysisMode='route';
-    const here=locateOnRoute();
-    $('routeStatus').innerHTML=`<span class="ok"><b>GPX 已啟用，路線方向優先</b></span>｜${f.name}｜${route.at(-1).cum.toFixed(1)} km${here?`｜目前約 ${here.cum.toFixed(1)} km｜離路線 ${here.d.toFixed(1)} km`:''}`;
-    render();
-    setTimeout(()=>focusMap(20),100);
+    const text=await f.text();
+    if(id!==routeLoadId)return;
+    applyRoute(text,f.name);
   }catch(err){
-    route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;mapInitialFocused=false;mapUserMoved=false;analysisMode='heading';
-    $('routeStatus').innerHTML=`<span class="bad">${err.message}</span>`;
+    if(id===routeLoadId)$('routeStatus').textContent='路線載入失敗：'+err.message;
   }
 };
 $('clearRouteBtn').onclick=()=>{
+  ++routeLoadId;
   route=[];routeSamples=[];currentRouteKm=null;currentRouteHeading=null;mapInitialFocused=false;mapUserMoved=false;analysisMode='heading';
   $('gpxFile').value='';
   $('routeStatus').innerHTML='目前：無路線，使用 GPS heading';
@@ -756,6 +784,8 @@ $('voiceTestBtn').onclick=()=>{
 };
 
 setInterval(()=>{if(!lastCwaFetch){$('countdown').textContent='CWA 尚未更新';return}const ago=Math.floor((Date.now()-lastCwaFetch)/60000);let next='—';if(nextCwaFetch){const s=Math.max(0,Math.floor((nextCwaFetch-Date.now())/1000));next=`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}$('countdown').textContent=`CWA 上次更新 ${ago} 分前｜下次 ${next}`},1000);
+initMap();
+loadDefaultRoute();
 </script>
 </body>
 </html>
